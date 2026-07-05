@@ -24,9 +24,9 @@ Explicitly NOT in v1 (future iterations):
     - token-budget estimation warnings
 
 Usage:
-    python3 scoper.py --scope "ubah button di header" [--root .] [--max 5]
-    python3 scoper.py --build-index [--root .]     # force rebuild cache
-    python3 scoper.py --check [--root .]           # just report cache freshness
+    python3 scripts/scoper.py --scope "ubah button di header" [--root .] [--max 5]
+    python3 scripts/scoper.py --build-index [--root .]     # force rebuild cache
+    python3 scripts/scoper.py --check [--root .]           # just report cache freshness
 
 Output (stdout, JSON):
     {
