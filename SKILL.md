@@ -90,11 +90,29 @@ The script returns JSON:
   handful of files would be counterproductive; a full-project approach
   is correct here.
 
-## Current version scope (v1 — minimal)
+## How matching works (for context, not required reading to use the skill)
 
-This version matches candidates by filename/path fuzzy matching only.
-It does not yet parse import/dependency graphs, symbol names inside
-files, or reuse scoping history across prompts. If matching misses a
-file because of non-obvious naming (e.g. the component inside
-`Nav.jsx` is actually named `TopHeader`), fall back to asking the user
-rather than reading broadly.
+The scoper combines three signals when ranking candidate files:
+
+1. **Filename/path matching** — does the prompt mention the file or
+   folder name (including tokenized camelCase/kebab-case, e.g. "header"
+   matches `TopHeader.jsx`)?
+2. **Symbol matching** — does the prompt mention a function/component/
+   class name declared *inside* a file, even if the filename itself
+   doesn't match (e.g. `TopHeader` declared inside `Nav.jsx`)?
+3. **Git-hot boost** — files with uncommitted changes or touched in the
+   last few commits get a small ranking boost, since vibe-coding prompts
+   are often continuations of whatever was just being worked on. This
+   only nudges ranking of files that are already relevant — it never
+   surfaces an unrelated file purely because it was recently edited.
+
+It also keeps a small **session memory** (`.scoper_cache/session_log.json`)
+of recent prompts and their resulting candidates. If a new prompt is
+similar to a recent one, files from that prior result get a small boost —
+useful for multi-turn sessions like "lanjutin yang tadi, tambahin border
+juga."
+
+Still not included: import/dependency graph traversal, and
+monorepo/package-boundary awareness. If matching misses a file due to
+very non-obvious naming or cross-file relationships, fall back to asking
+the user rather than reading broadly.

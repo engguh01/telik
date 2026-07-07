@@ -36,29 +36,41 @@ A short list of candidate file paths
 Agent reads ONLY those files, then executes the edit
 ```
 
-## Features (v1 — minimal)
+## Features
 
 - **`.gitignore`-aware file listing** via `git ls-files` — `node_modules`,
   build output, etc. are excluded automatically, no manual ignore-list
   needed. Falls back to a basic `os.walk` + ignore-list for non-git
   projects.
-- **Caching** — the file list is cached in `.scoper_cache/` per project so
-  repeated prompts in the same session are cheap after the first call.
+- **Caching** — the file list (plus symbol index) is cached in
+  `.scoper_cache/` per project so repeated prompts in the same session
+  are cheap after the first call.
 - **Git-aware cache invalidation** — uses the HEAD commit hash + dirty
   file count as a fingerprint when the project is a git repo; falls back
   to a time-based (mtime) check otherwise.
-- **Fuzzy filename matching** — extracts keywords from the prompt and
-  scores candidate files by substring + fuzzy similarity
-  (stdlib `difflib`, no extra dependencies).
+- **Filename/path matching** — extracts keywords from the prompt and
+  scores candidate files by tokenized (camelCase/kebab-case-aware)
+  substring matching + fuzzy similarity (stdlib `difflib`, no extra
+  dependencies).
+- **Symbol matching** — regex-based extraction of function/class/component
+  names declared inside each file, so a prompt mentioning `TopHeader`
+  still finds it even if it's declared inside a file named `Nav.jsx`.
+- **Git-hot recency boost** — files with uncommitted changes or touched
+  in the last 5 commits get a small ranking boost, since vibe-coding
+  prompts are often continuations of whatever was just being worked on.
+  Only ever boosts files that are already independently relevant.
+- **Session memory** — logs recent prompts and their resulting
+  candidates (`.scoper_cache/session_log.json`); a new prompt similar to
+  a recent one gets a small boost toward those same files, helping
+  multi-turn sessions ("lanjutin yang tadi, tambahin border juga").
 
 ### Not yet included (planned)
 
-- Import/dependency graph matching (e.g. following `import` statements to
-  catch files that don't share keywords with the prompt)
-- Symbol/ctags indexing (matching function/component names *inside*
-  files, not just filenames)
-- Session memory (reusing prior scoping results across a series of
-  related prompts)
+- Import/dependency graph matching (following `import`/`require`
+  statements to catch related files that share no keywords with the
+  prompt)
+- Monorepo/package-boundary awareness (avoid cross-package false matches
+  when a project has multiple `package.json`s)
 - Token-budget estimation warnings for oversized candidate files
 
 ## Installation
@@ -117,8 +129,11 @@ python3 scripts/scoper.py --root . --scope "ubah button di header samain tema lo
 Other flags:
 
 ```bash
-python3 scripts/scoper.py --root . --build-index   # force cache rebuild
-python3 scripts/scoper.py --root . --check         # report cache freshness only
+python3 scripts/scoper.py --root . --build-index          # force cache rebuild
+python3 scripts/scoper.py --root . --check                # report cache freshness only
+python3 scripts/scoper.py --root . --scope "..." --no-symbols
+python3 scripts/scoper.py --root . --scope "..." --no-git-boost
+python3 scripts/scoper.py --root . --scope "..." --no-session-memory
 ```
 
 ## Requirements
