@@ -936,7 +936,7 @@ def score_file(
     freq_map: Optional[Dict[str, float]] = None,
 ) -> Tuple[float, int]:
     path_lower = path.lower()
-    stem = os.path.splitext(os.path.basename(path_lower))[0]
+    stem = os.path.splitext(os.path.basename(path))[0]
 
     stem_score = text_match_score(stem, keywords)
     path_score = text_match_score(path_lower, keywords)
