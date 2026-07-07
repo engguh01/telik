@@ -117,13 +117,18 @@ python3 scripts/scoper.py --root . --scope "..." --no-token-warnings
 
 Here is a real comparison from a Next.js POS project with 111 tracked files. The prompt: *"fix the add product button on the inventory page"*.
 
-| Approach | Files read | Tokens | Savings |
-|---|---|---|---|
-| **With spotter** | 6 | ~1,800 | baseline |
-| Without (keyword grep + read matches) | ~17 | ~51,000 | 96.5% |
-| Without (read entire `src/` directory) | ~70 | ~93,000 | 98.1% |
+```mermaid
+%%{init: {"theme": "base"}}%%
+graph LR
+    A["<b>Spotter</b><br/>~1,800 tokens<br/>6 files"]:::green
+    B["<b>Grep agent</b><br/>~51,000 tokens<br/>17 files"]:::amber
+    C["<b>Full scan</b><br/>~93,000 tokens<br/>70 files"]:::red
+    classDef green fill:#22c55e,stroke:#16a34a,color:#fff
+    classDef amber fill:#f59e0b,stroke:#d97706,color:#000
+    classDef red fill:#ef4444,stroke:#dc2626,color:#fff
+```
 
-A naive agent that greps for keywords and reads every match consumes about 28x more context than one using spotter. An agent that scans the whole source tree uses 51x more. Both approaches still produce the same edit: spotter finds the right files first.
+A naive agent that greps for keywords and reads every match consumes 28x more context. An agent that scans the whole source tree uses 51x more. Both produce the same edit: spotter finds the right files first.
 
 ## Requirements
 
