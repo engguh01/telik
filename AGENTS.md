@@ -18,6 +18,9 @@ python3 scripts/scoper.py --max 10                # default: 5
 python3 scripts/scoper.py --no-symbols            # disable symbol matching
 python3 scripts/scoper.py --no-git-boost          # disable git-hot boost
 python3 scripts/scoper.py --no-session-memory     # disable session memory
+python3 scripts/scoper.py --no-import-graph       # disable import-graph expansion
+python3 scripts/scoper.py --no-monorepo           # disable cross-package penalty
+python3 scripts/scoper.py --no-token-warnings     # disable token-budget warnings
 ```
 
 ## Caching
@@ -31,7 +34,10 @@ python3 scripts/scoper.py --no-session-memory     # disable session memory
 - Symbol matching: regex-based extraction of function/class/component names inside files (JS/TS/Python/Go etc.)
 - Git-hot recency boost: staged/unstaged changes + last 5 commits get ranking nudge
 - Session memory: logs prompt→candidates in session_log.json for multi-turn continuity
-- Output: JSON with `{cache_status, candidates, total_files_indexed}`
+- Import graph: resolves JS/TS/Python relative imports; 1-hop expansion surfaces related_files
+- Monorepo detection: scans for package.json/pyproject.toml/go.mod etc.; cross-package candidates penalized
+- Token warnings: rough size-based estimate (~4 chars/token), warns if per-file >2K or total >6K
+- Output: JSON with `{cache_status, candidates, related_files, token_estimate, warnings, total_files_indexed}`
 
 ## Distinctions
 - SKILL.md goes into `.opencode/skills/spotter/` or `~/.config/opencode/skills/spotter/`

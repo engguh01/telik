@@ -28,12 +28,14 @@ User prompt
    │
    ▼
 scripts/scoper.py --scope "<prompt>"
-   │  (gitignore-aware file list, cached, fuzzy-matched against the prompt)
+   │  (gitignore-aware file list, cached, scored by filename/symbol/
+   │   git-recency/session-history, expanded via the import graph)
    ▼
-A short list of candidate file paths
+candidates (primary)  +  related_files (import-graph context)
    │
    ▼
-Agent reads ONLY those files, then executes the edit
+Agent reads candidates (and related_files only if actually needed),
+then executes the edit
 ```
 
 ## Features
@@ -42,8 +44,8 @@ Agent reads ONLY those files, then executes the edit
   build output, etc. are excluded automatically, no manual ignore-list
   needed. Falls back to a basic `os.walk` + ignore-list for non-git
   projects.
-- **Caching** — the file list (plus symbol index) is cached in
-  `.scoper_cache/` per project so repeated prompts in the same session
+- **Caching** — the file list, symbol index, and import graph are cached
+  in `.scoper_cache/` per project so repeated prompts in the same session
   are cheap after the first call.
 - **Git-aware cache invalidation** — uses the HEAD commit hash + dirty
   file count as a fingerprint when the project is a git repo; falls back
@@ -58,20 +60,25 @@ Agent reads ONLY those files, then executes the edit
 - **Git-hot recency boost** — files with uncommitted changes or touched
   in the last 5 commits get a small ranking boost, since vibe-coding
   prompts are often continuations of whatever was just being worked on.
-  Only ever boosts files that are already independently relevant.
 - **Session memory** — logs recent prompts and their resulting
   candidates (`.scoper_cache/session_log.json`); a new prompt similar to
   a recent one gets a small boost toward those same files, helping
   multi-turn sessions ("lanjutin yang tadi, tambahin border juga").
+- **Import/dependency graph matching** — resolves relative `import`/
+  `require` statements (JS/TS/Vue/Svelte/Astro and Python) to real project
+  files, then surfaces direct imports/importers of primary candidates as
+  `related_files` — e.g. a shared `Button.jsx`/theme file, even if it
+  shares no keywords with the prompt.
+- **Monorepo/package-boundary awareness** — detects package roots via
+  marker files (`package.json`, `pyproject.toml`, `go.mod`, `Cargo.toml`,
+  `composer.json`) and ranks candidates outside the top match's package
+  lower (never hard-excluded, just deprioritized).
+- **Token-budget warnings** — a rough size-based token estimate
+  (`token_estimate`) for every candidate/related file, with `warnings`
+  when a single file or the total would be wasteful to read in full.
 
-### Not yet included (planned)
-
-- Import/dependency graph matching (following `import`/`require`
-  statements to catch related files that share no keywords with the
-  prompt)
-- Monorepo/package-boundary awareness (avoid cross-package false matches
-  when a project has multiple `package.json`s)
-- Token-budget estimation warnings for oversized candidate files
+All of the above (except the core file listing + cache) can be toggled
+off via CLI flags for debugging/comparison — see Usage below.
 
 ## Installation
 
@@ -122,7 +129,16 @@ python3 scripts/scoper.py --root . --scope "ubah button di header samain tema lo
   "candidates": [
     "src/components/Header.jsx",
     "src/components/Login.jsx"
-  ]
+  ],
+  "related_files": [
+    "src/components/Button.jsx"
+  ],
+  "token_estimate": {
+    "src/components/Header.jsx": 812,
+    "src/components/Login.jsx": 340,
+    "src/components/Button.jsx": 210
+  },
+  "warnings": []
 }
 ```
 
@@ -134,6 +150,9 @@ python3 scripts/scoper.py --root . --check                # report cache freshne
 python3 scripts/scoper.py --root . --scope "..." --no-symbols
 python3 scripts/scoper.py --root . --scope "..." --no-git-boost
 python3 scripts/scoper.py --root . --scope "..." --no-session-memory
+python3 scripts/scoper.py --root . --scope "..." --no-import-graph
+python3 scripts/scoper.py --root . --scope "..." --no-monorepo
+python3 scripts/scoper.py --root . --scope "..." --no-token-warnings
 ```
 
 ## Requirements

@@ -8,24 +8,37 @@ a short instruction like "ubah button di header".
 Core pipeline:
     1. .gitignore-aware file listing via `git ls-files` (falls back to a
        basic os.walk + ignore-list if the project isn't a git repo).
-    2. Cache the file list + lightweight symbol index to disk so repeated
-       prompts in the same session don't re-walk/re-scan every time.
+    2. Cache the file list + symbol index + import graph + package
+       boundaries to disk so repeated prompts in the same session don't
+       re-walk/re-scan every time.
     3. Cache invalidation: git-aware first (HEAD commit hash + dirty
        status), mtime-based fallback for non-git projects.
-    4. Candidate scoring combines three signals:
-         a. filename/path fuzzy match  (does the prompt mention the
-                                         file/folder name?)
-         b. symbol match               (does the prompt mention a
-                                         function/component/class name
-                                         declared INSIDE the file?)
-         c. git-hot boost              (was this file touched recently —
-                                         staged, unstaged, or in the last
-                                         few commits?)
-    5. Session memory: logs prompt -> candidates per session. If the new
-       prompt is similar to a recent one, files from that prior result
-       get a small relevance boost (helps multi-turn "lanjutin yang tadi"
-       vibe-coding sessions). This only nudges ranking — it never adds a
-       file that has zero independent relevance to the current prompt.
+    4. Primary candidate scoring combines four signals:
+         a. filename/path match   (does the prompt mention the file or
+                                    folder name — tokenized camelCase/
+                                    kebab-case aware?)
+         b. symbol match          (does the prompt mention a function/
+                                    component/class name declared INSIDE
+                                    a file, even if the filename itself
+                                    doesn't match?)
+         c. git-hot boost         (was this file touched recently —
+                                    staged, unstaged, or in the last few
+                                    commits?)
+         d. session memory boost  (did a similar recent prompt already
+                                    point at this file?)
+       Monorepo awareness applies a penalty to candidates that live in a
+       different package/workspace than the top match, so cross-package
+       false positives rank lower (never hard-excluded).
+    5. Import-graph expansion: once primary candidates are decided, their
+       direct imports and direct importers (1-hop) are surfaced
+       separately as `related_files` — e.g. a shared Button/theme file
+       that a matched component imports, even though it shares no
+       keywords with the prompt. These are reference/context files, not
+       primary edit targets.
+    6. Token-budget estimate: a rough size-based token estimate is
+       computed for every primary + related file, with warnings emitted
+       if any single file or the total is large enough that reading it
+       in full would be wasteful.
 
 Usage:
     python3 scoper.py --scope "ubah button di header" [--root .] [--max 5]
@@ -33,15 +46,21 @@ Usage:
     python3 scoper.py --check [--root .]           # report cache freshness
 
     Flags to disable individual signals (useful for debugging/comparison):
-        --no-symbols        disable symbol-index matching
-        --no-git-boost      disable git-hot recency boost
-        --no-session-memory disable session-memory boost & logging
+        --no-symbols          disable symbol-index matching
+        --no-git-boost        disable git-hot recency boost
+        --no-session-memory   disable session-memory boost & logging
+        --no-import-graph     disable related_files expansion
+        --no-monorepo         disable cross-package penalty
+        --no-token-warnings   disable token-budget estimate/warnings
 
 Output (stdout, JSON):
     {
       "cache_status": "hit" | "rebuilt",
       "total_files_indexed": 132,
-      "candidates": ["src/components/Header.jsx", ...]
+      "candidates": ["src/components/Header.jsx", ...],
+      "related_files": ["src/components/Button.jsx", ...],
+      "token_estimate": {"src/components/Header.jsx": 812, ...},
+      "warnings": ["..."]
     }
 """
 
@@ -68,16 +87,21 @@ FALLBACK_IGNORE_DIRS = {
     "venv", ".venv", "__pycache__", ".scoper_cache",
 }
 
-# Extensions worth scanning for symbols. Kept small and cheap on purpose —
-# this is regex-based, not a real parser.
-SYMBOL_EXTENSIONS = {
-    ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte",
+# Extensions worth scanning for symbols/imports. Kept small and cheap on
+# purpose — this is regex-based, not a real parser.
+CODE_EXTENSIONS = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
     ".py", ".go", ".rb", ".php", ".java", ".astro",
 }
 
-# Cap how much of a file we read for symbol extraction. Most declarations
-# worth matching live near the top; this keeps indexing fast on huge files.
-SYMBOL_SCAN_BYTE_LIMIT = 20_000
+JS_LIKE_EXTENSIONS = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
+}
+
+# Cap how much of a file we read for symbol/import extraction. Most
+# declarations worth matching live near the top; this keeps indexing fast
+# on huge files.
+CODE_SCAN_BYTE_LIMIT = 20_000
 
 SYMBOL_PATTERNS = [
     # JS/TS/JSX/TSX/Vue/Svelte/Astro-ish declarations
@@ -93,6 +117,33 @@ SYMBOL_PATTERNS = [
     # Go
     re.compile(r"\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("),
 ]
+
+IMPORT_PATTERNS_JS = [
+    re.compile(r"import\s+(?:[^'\";]+\sfrom\s+)?['\"]([^'\"]+)['\"]"),
+    re.compile(r"require\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+    re.compile(r"export\s+(?:\*|\{[^}]*\})\s+from\s+['\"]([^'\"]+)['\"]"),
+]
+IMPORT_PATTERNS_PY = [
+    re.compile(r"^\s*from\s+([\.\w]+)\s+import", re.MULTILINE),
+    re.compile(r"^\s*import\s+([\.\w]+)", re.MULTILINE),
+]
+
+# Resolution suffixes tried when turning a relative JS import ("./Button")
+# into an actual project file path.
+JS_RESOLUTION_SUFFIXES = [
+    "", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
+    "/index.js", "/index.jsx", "/index.ts", "/index.tsx",
+]
+
+# Marker files used to detect package/workspace boundaries in a monorepo.
+PACKAGE_MARKER_FILES = {
+    "package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json",
+}
+
+# Token-budget thresholds (rough heuristic: ~4 chars per token).
+CHARS_PER_TOKEN_ESTIMATE = 4
+TOKEN_WARN_FILE_THRESHOLD = 2000
+TOKEN_WARN_TOTAL_THRESHOLD = 6000
 
 
 def run_git(args, cwd):
@@ -183,7 +234,9 @@ def git_hot_files(root):
     weights = {}
 
     dirty = run_git(["status", "--porcelain"], root) or ""
-    for line in dirty.strip().splitlines():
+    for line in dirty.splitlines():
+        if not line:
+            continue
         # porcelain format: "XY path" (rename shows "old -> new")
         path = line[3:].split(" -> ")[-1].strip()
         if path:
@@ -246,30 +299,156 @@ def is_cache_fresh(root, cached):
     return (time.time() - cached_at) < max_age_seconds
 
 
-def extract_symbols(root, rel_path):
+# --- Symbol + import extraction (single read pass per file) ---------------
+
+def analyze_file(root, rel_path):
     """
-    Regex-based, best-effort extraction of top-level-ish declaration names
-    from a file. Not a real parser — just enough to catch cases where the
-    prompt mentions a component/function name that doesn't match the
-    filename (e.g. `TopHeader` declared inside `Nav.jsx`).
+    Single-read analysis of a file: extracts both declared symbols
+    (functions/classes/components) and raw import/require targets.
+    Combined into one function so we don't read the same file twice.
     """
     ext = os.path.splitext(rel_path)[1].lower()
-    if ext not in SYMBOL_EXTENSIONS:
-        return []
+    if ext not in CODE_EXTENSIONS:
+        return [], [], None
 
     full_path = os.path.join(root, rel_path)
     try:
         with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(SYMBOL_SCAN_BYTE_LIMIT)
+            content = f.read(CODE_SCAN_BYTE_LIMIT)
     except OSError:
-        return []
+        return [], [], None
 
     symbols = set()
     for pattern in SYMBOL_PATTERNS:
         for match in pattern.finditer(content):
             symbols.add(match.group(1))
-    return sorted(symbols)
 
+    raw_imports = []
+    import_kind = None
+    if ext in JS_LIKE_EXTENSIONS:
+        import_kind = "js"
+        for pattern in IMPORT_PATTERNS_JS:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".py":
+        import_kind = "py"
+        for pattern in IMPORT_PATTERNS_PY:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+
+    return sorted(symbols), raw_imports, import_kind
+
+
+def resolve_js_import(importer_rel_path, raw_import, files_set):
+    """Resolves a relative JS/TS import ('./Button') to a real project
+    file path. Skips bare package imports (e.g. 'react') since those
+    aren't part of the project and can't be scoped to."""
+    if not raw_import.startswith("."):
+        return None
+
+    importer_dir = os.path.dirname(importer_rel_path)
+    base = os.path.normpath(os.path.join(importer_dir, raw_import))
+    base = base.replace(os.sep, "/")
+
+    for suffix in JS_RESOLUTION_SUFFIXES:
+        candidate = (base + suffix) if suffix else base
+        if candidate in files_set:
+            return candidate
+    return None
+
+
+def resolve_python_import(importer_rel_path, raw_import, files_set):
+    """Best-effort resolution of a Python import to a project file path.
+    Handles simple relative ('.module') and absolute ('package.module')
+    forms; does not fully replicate Python's import machinery."""
+    importer_dir = os.path.dirname(importer_rel_path)
+
+    if raw_import.startswith("."):
+        parts = [p for p in raw_import.lstrip(".").split(".") if p]
+        base = os.path.normpath(os.path.join(importer_dir, *parts)) if parts else importer_dir
+    else:
+        parts = raw_import.split(".")
+        base = os.path.normpath(os.path.join(*parts))
+
+    base = base.replace(os.sep, "/")
+    for suffix in [".py", "/__init__.py"]:
+        candidate = base + suffix
+        if candidate in files_set:
+            return candidate
+    return None
+
+
+def build_import_graph(root, files):
+    """
+    Returns (imports_forward, importers_reverse):
+      imports_forward[file]  = list of files it imports (resolved, exist in project)
+      importers_reverse[file] = list of files that import it
+    Only includes edges we could actually resolve to a real project file —
+    external package imports (react, lodash, etc.) are not part of the graph.
+    """
+    files_set = set(files)
+    imports_forward = {}
+
+    for rel_path in files:
+        _symbols, raw_imports, kind = analyze_file(root, rel_path)
+        if not raw_imports:
+            continue
+        resolved = set()
+        for raw in raw_imports:
+            target = None
+            if kind == "js":
+                target = resolve_js_import(rel_path, raw, files_set)
+            elif kind == "py":
+                target = resolve_python_import(rel_path, raw, files_set)
+            if target and target != rel_path:
+                resolved.add(target)
+        if resolved:
+            imports_forward[rel_path] = sorted(resolved)
+
+    importers_reverse = {}
+    for src, targets in imports_forward.items():
+        for tgt in targets:
+            importers_reverse.setdefault(tgt, []).append(src)
+
+    return imports_forward, importers_reverse
+
+
+def build_symbol_index(root, files):
+    symbols = {}
+    for rel_path in files:
+        syms, _raw_imports, _kind = analyze_file(root, rel_path)
+        if syms:
+            symbols[rel_path] = syms
+    return symbols
+
+
+# --- Monorepo / package boundary detection ---------------------------------
+
+def detect_package_roots(files):
+    """
+    Returns a list of directories (relative to project root) that contain
+    a package marker file (package.json, pyproject.toml, etc.), sorted
+    longest-path-first so prefix matching finds the most specific root.
+    Always includes "." as the fallback root.
+    """
+    roots = {"."}
+    for f in files:
+        base = os.path.basename(f)
+        if base in PACKAGE_MARKER_FILES:
+            d = os.path.dirname(f)
+            roots.add(d if d else ".")
+    return sorted(roots, key=lambda r: -len(r))
+
+
+def package_for_file(rel_path, sorted_roots):
+    dirname = os.path.dirname(rel_path).replace(os.sep, "/")
+    for root in sorted_roots:
+        if root == ".":
+            continue
+        if dirname == root or dirname.startswith(root + "/"):
+            return root
+    return "."
+
+
+# --- Index build/load -------------------------------------------------------
 
 def build_index(root):
     if is_git_repo(root):
@@ -279,17 +458,18 @@ def build_index(root):
         files = list_files_fallback(root)
         fingerprint = None
 
-    symbols = {}
-    for rel_path in files:
-        syms = extract_symbols(root, rel_path)
-        if syms:
-            symbols[rel_path] = syms
+    symbols = build_symbol_index(root, files)
+    imports_forward, importers_reverse = build_import_graph(root, files)
+    package_roots = detect_package_roots(files)
 
     data = {
         "built_at": time.time(),
         "git_fingerprint": fingerprint,
         "files": files,
         "symbols": symbols,
+        "imports": imports_forward,
+        "importers": importers_reverse,
+        "package_roots": package_roots,
     }
     save_cache(root, data)
     return data
@@ -337,8 +517,6 @@ def session_memory_boost(prompt, session_log):
         ).ratio()
         if similarity >= SESSION_SIMILARITY_THRESHOLD:
             for path in entry.get("candidates", []):
-                # Scale by similarity so a near-identical follow-up counts
-                # more than a loosely-related one.
                 boosts[path] = max(boosts.get(path, 0.0), SESSION_BOOST * similarity)
     return boosts
 
@@ -378,8 +556,7 @@ def text_match_score(text_lower, keywords):
       2. substring match against the raw, unsplit text -> medium
       3. difflib fuzzy ratio, but only above a high cutoff, to catch
          near-miss typos/variants without matching on coincidental
-         character overlap between otherwise-unrelated short strings
-         (e.g. "topheader" vs "footer" should NOT match).
+         character overlap between otherwise-unrelated short strings.
     """
     tokens = split_identifier(text_lower)
     best = 0.0
@@ -405,9 +582,6 @@ def score_file(path, keywords, symbols_for_file, hot_weight, session_boost):
     path_lower = path.lower()
     stem = os.path.splitext(os.path.basename(path_lower))[0]
 
-    # Match against the filename stem AND the full path (keywords
-    # sometimes refer to a folder name, e.g. "header" as a directory
-    # containing index.jsx).
     filename_score = max(
         text_match_score(stem, keywords),
         text_match_score(path_lower, keywords),
@@ -422,12 +596,98 @@ def score_file(path, keywords, symbols_for_file, hot_weight, session_boost):
     # Git-hot boost and session boost only ever apply on top of a base
     # score that already shows some independent relevance — this prevents
     # an unrelated-but-recently-edited file from being surfaced by
-    # recency alone.
+    # recency alone. Deliberately NOT clamped to 1.0: these scores are
+    # only used internally for ranking (never exposed in the output), so
+    # letting boosts push a score above 1.0 preserves useful tie-breaks
+    # between files with an identical base filename/symbol match (e.g.
+    # two same-named components in different packages).
     if base_score > 0:
         base_score += hot_weight * 0.15
         base_score += session_boost
 
-    return min(base_score, 1.0)
+    return base_score
+
+
+def apply_monorepo_penalty(scored, index):
+    """
+    If the project has more than one detected package root, candidates
+    living in a different package than the top-scoring candidate get a
+    ranking penalty (not exclusion) — reduces cross-package false
+    positives (e.g. a same-named component in a different app/package)
+    without discarding genuinely shared/cross-package files outright.
+    Only activates when the top score is confident enough to trust as an
+    anchor.
+    """
+    package_roots = index.get("package_roots", ["."])
+    if len(package_roots) <= 1 or not scored:
+        return scored
+
+    top_file, top_score = max(scored, key=lambda pair: pair[1])
+    if top_score < 0.6:
+        return scored
+
+    top_package = package_for_file(top_file, package_roots)
+    adjusted = []
+    for f, score in scored:
+        if score > 0 and package_for_file(f, package_roots) != top_package:
+            score *= 0.6
+        adjusted.append((f, score))
+    return adjusted
+
+
+def expand_related_files(primary_files, index, max_related=3, per_file_neighbors=4):
+    """
+    1-hop import-graph expansion: direct imports and direct importers of
+    the primary candidates, surfaced as reference/context files rather
+    than primary edit targets (e.g. a shared Button/theme file that a
+    matched component imports).
+    """
+    imports_map = index.get("imports", {})
+    importers_map = index.get("importers", {})
+
+    seen = set(primary_files)
+    related = []
+    for f in primary_files:
+        neighbors = (
+            imports_map.get(f, [])[:per_file_neighbors]
+            + importers_map.get(f, [])[:per_file_neighbors]
+        )
+        for n in neighbors:
+            if n in seen:
+                continue
+            seen.add(n)
+            related.append(n)
+            if len(related) >= max_related:
+                return related
+    return related
+
+
+def estimate_tokens(root, rel_path):
+    full_path = os.path.join(root, rel_path)
+    try:
+        size_bytes = os.path.getsize(full_path)
+    except OSError:
+        return 0
+    return size_bytes // CHARS_PER_TOKEN_ESTIMATE
+
+
+def build_token_report(root, files):
+    token_estimate = {f: estimate_tokens(root, f) for f in files}
+    warnings = []
+    for f, tokens in token_estimate.items():
+        if tokens >= TOKEN_WARN_FILE_THRESHOLD:
+            warnings.append(
+                f"{f} is ~{tokens} tokens — consider reading only the "
+                f"relevant section instead of the whole file."
+            )
+    total = sum(token_estimate.values())
+    if total >= TOKEN_WARN_TOTAL_THRESHOLD:
+        warnings.append(
+            f"Total estimated context across candidates is ~{total} "
+            f"tokens — consider narrowing the prompt or working in "
+            f"smaller steps."
+        )
+    return token_estimate, warnings
 
 
 def match_candidates(
@@ -439,10 +699,16 @@ def match_candidates(
     use_symbols=True,
     use_git_boost=True,
     use_session_memory=True,
+    use_import_graph=True,
+    use_monorepo=True,
+    use_token_warnings=True,
 ):
     keywords = extract_keywords(prompt)
     if not keywords:
-        return []
+        return {
+            "candidates": [], "related_files": [],
+            "token_estimate": {}, "warnings": [],
+        }
 
     files = index["files"]
     symbols_map = index.get("symbols", {}) if use_symbols else {}
@@ -464,19 +730,35 @@ def match_candidates(
         )
         scored.append((f, score))
 
+    if use_monorepo:
+        scored = apply_monorepo_penalty(scored, index)
+
     scored = [pair for pair in scored if pair[1] >= min_score]
     scored.sort(key=lambda pair: pair[1], reverse=True)
-    candidates = [f for f, _ in scored[:max_results]]
+    primary = [f for f, _ in scored[:max_results]]
+
+    related = []
+    if use_import_graph and primary:
+        related = expand_related_files(primary, index)
+
+    token_estimate, warnings = ({}, [])
+    if use_token_warnings:
+        token_estimate, warnings = build_token_report(root, primary + related)
 
     if use_session_memory:
         session_log.append({
             "prompt": prompt,
-            "candidates": candidates,
+            "candidates": primary,
             "timestamp": time.time(),
         })
         save_session_log(root, session_log)
 
-    return candidates
+    return {
+        "candidates": primary,
+        "related_files": related,
+        "token_estimate": token_estimate,
+        "warnings": warnings,
+    }
 
 
 # --- CLI ---------------------------------------------------------------------
@@ -497,6 +779,12 @@ def main():
                          help="Disable git-hot recency boost")
     parser.add_argument("--no-session-memory", action="store_true",
                          help="Disable session-memory boost & logging")
+    parser.add_argument("--no-import-graph", action="store_true",
+                         help="Disable related_files expansion via import graph")
+    parser.add_argument("--no-monorepo", action="store_true",
+                         help="Disable cross-package ranking penalty")
+    parser.add_argument("--no-token-warnings", action="store_true",
+                         help="Disable token-budget estimate/warnings")
     args = parser.parse_args()
 
     root = os.path.abspath(args.root)
@@ -509,6 +797,8 @@ def main():
             "cache_fresh": fresh,
             "total_files_indexed": len(cached["files"]) if cached else 0,
             "total_files_with_symbols": len(cached.get("symbols", {})) if cached else 0,
+            "total_files_with_imports": len(cached.get("imports", {})) if cached else 0,
+            "package_roots": cached.get("package_roots", ["."]) if cached else ["."],
         }, indent=2))
         return
 
@@ -518,10 +808,13 @@ def main():
         "cache_status": cache_status,
         "total_files_indexed": len(index["files"]),
         "candidates": [],
+        "related_files": [],
+        "token_estimate": {},
+        "warnings": [],
     }
 
     if args.scope:
-        result["candidates"] = match_candidates(
+        result.update(match_candidates(
             index,
             args.scope,
             root,
@@ -529,7 +822,10 @@ def main():
             use_symbols=not args.no_symbols,
             use_git_boost=not args.no_git_boost,
             use_session_memory=not args.no_session_memory,
-        )
+            use_import_graph=not args.no_import_graph,
+            use_monorepo=not args.no_monorepo,
+            use_token_warnings=not args.no_token_warnings,
+        ))
 
     print(json.dumps(result, indent=2))
 

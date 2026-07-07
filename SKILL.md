@@ -32,9 +32,28 @@ The script returns JSON:
 {
   "cache_status": "hit" | "rebuilt",
   "total_files_indexed": 132,
-  "candidates": ["src/components/Header.jsx", "src/components/Login.jsx"]
+  "candidates": ["src/components/Header.jsx"],
+  "related_files": ["src/components/Button.jsx"],
+  "token_estimate": {"src/components/Header.jsx": 812, "src/components/Button.jsx": 210},
+  "warnings": []
 }
 ```
+
+- `candidates` — the primary files to read and edit.
+- `related_files` — files structurally connected to a candidate via the
+  import graph (something a candidate imports, or something that imports
+  a candidate) that didn't independently match the prompt's keywords.
+  Treat these as reference/context only (e.g. a shared theme/Button file
+  a matched component imports) — don't edit them unless the task actually
+  requires it.
+- `token_estimate` — rough token-size estimate per file (candidates +
+  related_files). Useful for judging whether a file is worth reading in
+  full vs. grep-ing just the relevant part.
+- `warnings` — populated when a candidate file is unusually large, or the
+  combined estimated size of all candidates is large. Take these
+  seriously: prefer reading only the relevant section (e.g. via `grep -n`
+  or a targeted `view` range) over reading the whole file when a warning
+  is present.
 
 - The file list is already `.gitignore`-aware (via `git ls-files`), so
   `node_modules`, build output, etc. are already excluded — don't add
@@ -42,6 +61,10 @@ The script returns JSON:
 - The cache lives in `<project_root>/.scoper_cache/` and is reused across
   calls within the same working session, so repeated prompts in one
   session are cheap after the first call.
+- In monorepos (multiple `package.json`/`pyproject.toml`/etc. roots
+  detected), candidates outside the package of the top match are ranked
+  lower automatically — you don't need to reason about this yourself,
+  just trust the ordering `candidates` already comes in.
 
 **Step 2 — Judge the candidates before reading anything.**
 
@@ -55,16 +78,21 @@ The script returns JSON:
   subfolders/packages), ask a single clarifying question before reading
   any of them.
 
-**Step 3 — Read only the candidate files, then execute.**
+**Step 3 — Read candidates first, `related_files` only if actually needed.**
 
-- Read/open only the paths returned in `candidates`. Do not proactively
-  read sibling files, entire directories, or the project tree "just in
-  case."
-- If, while editing, you discover you genuinely need a file not in the
-  candidate list (e.g. a shared style/theme file imported by a
-  candidate), it's fine to read that one additional file — but don't use
-  this as an excuse to widen the scope broadly. Read only what the edit
-  actually requires.
+- Read/open the paths in `candidates`. Do not proactively read sibling
+  files, entire directories, or the project tree "just in case."
+- `related_files` are surfaced via the import graph as likely *context*
+  (e.g. a shared component/theme file a candidate imports). Only open one
+  if the edit genuinely requires understanding or touching it — don't
+  read all of them by default just because they're listed.
+- If you discover mid-edit that you need a file not in either list, it's
+  fine to read that one additional file — but don't use this as an
+  excuse to widen the scope broadly. Read only what the edit actually
+  requires.
+- If `warnings` flagged a file as large, prefer a targeted read (grep for
+  the relevant function/section, or a bounded `view` range) over reading
+  the entire file.
 - Proceed with the code change using only this narrowed context.
 
 ## Explicit guardrails
@@ -92,7 +120,7 @@ The script returns JSON:
 
 ## How matching works (for context, not required reading to use the skill)
 
-The scoper combines three signals when ranking candidate files:
+The scoper combines four signals when ranking primary candidates:
 
 1. **Filename/path matching** — does the prompt mention the file or
    folder name (including tokenized camelCase/kebab-case, e.g. "header"
@@ -102,17 +130,25 @@ The scoper combines three signals when ranking candidate files:
    doesn't match (e.g. `TopHeader` declared inside `Nav.jsx`)?
 3. **Git-hot boost** — files with uncommitted changes or touched in the
    last few commits get a small ranking boost, since vibe-coding prompts
-   are often continuations of whatever was just being worked on. This
-   only nudges ranking of files that are already relevant — it never
-   surfaces an unrelated file purely because it was recently edited.
+   are often continuations of whatever was just being worked on.
+4. **Session memory** — a small log of recent prompts and their resulting
+   candidates (`.scoper_cache/session_log.json`); a new prompt similar to
+   a recent one gets a boost toward those same files (helps "lanjutin
+   yang tadi, tambahin border juga" follow-ups).
 
-It also keeps a small **session memory** (`.scoper_cache/session_log.json`)
-of recent prompts and their resulting candidates. If a new prompt is
-similar to a recent one, files from that prior result get a small boost —
-useful for multi-turn sessions like "lanjutin yang tadi, tambahin border
-juga."
+On top of that:
 
-Still not included: import/dependency graph traversal, and
-monorepo/package-boundary awareness. If matching misses a file due to
-very non-obvious naming or cross-file relationships, fall back to asking
-the user rather than reading broadly.
+- **Monorepo awareness** — if the project has multiple detected
+  package/workspace roots, candidates outside the package of the
+  top-scoring match are ranked lower (not excluded).
+- **Import-graph expansion** — direct imports/importers of primary
+  candidates are surfaced separately as `related_files`, so a shared
+  file (e.g. a Button/theme component) shows up even without keyword
+  overlap.
+- **Token-budget estimate** — every candidate + related file gets a rough
+  size estimate, with `warnings` when a file or the total is large enough
+  that reading it whole would be wasteful.
+
+None of these fully replace judgment: if matching still misses a file
+due to very unusual naming or project structure, fall back to asking the
+user rather than reading broadly.
