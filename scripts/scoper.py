@@ -3,55 +3,47 @@
 scoper.py — context-scoping helper for vibe-coding agents. Part of the
 "spotter" skill: locates candidate files BEFORE the calling agent reads
 any file contents, so the agent never has to scan the whole codebase for
-a short instruction like "ubah button di header".
+a short instruction like "fix the header button".
 
 Core pipeline:
-    1. .gitignore-aware file listing via `git ls-files` (falls back to a
-       basic os.walk + ignore-list if the project isn't a git repo).
+    1. .gitignore-aware file listing via `git ls-files` (falls back to
+       os.walk + .gitignore parsing if the project isn't a git repo).
     2. Cache the file list + symbol index + import graph + package
        boundaries to disk so repeated prompts in the same session don't
        re-walk/re-scan every time.
     3. Cache invalidation: git-aware first (HEAD commit hash + dirty
        status), mtime-based fallback for non-git projects.
     4. Primary candidate scoring combines four signals:
-         a. filename/path match   (does the prompt mention the file or
-                                    folder name — tokenized camelCase/
-                                    kebab-case aware?)
-         b. symbol match          (does the prompt mention a function/
-                                    component/class name declared INSIDE
-                                    a file, even if the filename itself
-                                    doesn't match?)
-         c. git-hot boost         (was this file touched recently —
-                                    staged, unstaged, or in the last few
-                                    commits?)
-         d. session memory boost  (did a similar recent prompt already
-                                    point at this file?)
+         a. filename/path match   (tokenized camelCase/kebab-case aware)
+         b. symbol match          (regex-extracted function/class/component
+                                   names inside JS, TS, Python, Go, Rust,
+                                   Kotlin, C#, Swift, Dart, and more)
+         c. git-hot boost         (staged, unstaged, or last 5 commits)
+         d. session memory boost  (similar recent prompts boost previous
+                                   candidates)
        Monorepo awareness applies a penalty to candidates that live in a
-       different package/workspace than the top match, so cross-package
-       false positives rank lower (never hard-excluded).
-    5. Import-graph expansion: once primary candidates are decided, their
-       direct imports and direct importers (1-hop) are surfaced
-       separately as `related_files` — e.g. a shared Button/theme file
-       that a matched component imports, even though it shares no
-       keywords with the prompt. These are reference/context files, not
-       primary edit targets.
-    6. Token-budget estimate: a rough size-based token estimate is
-       computed for every primary + related file, with warnings emitted
-       if any single file or the total is large enough that reading it
-       in full would be wasteful.
+       different package/workspace than the top match.
+    5. Import-graph expansion: resolves relative imports (JS, TS, Python,
+       Go, Rust, Ruby, PHP, Java) and surfaces direct imports/importers
+       as `related_files`.
+    6. Token-budget estimate with warnings for large files.
+    7. Config file support via ~/.scoperrc and project .scoperrc (JSON).
+    8. Binary file detection — binary files are indexed but skipped for
+       symbol/import extraction.
 
 Usage:
-    python3 scoper.py --scope "ubah button di header" [--root .] [--max 5]
-    python3 scoper.py --build-index [--root .]     # force rebuild cache
-    python3 scoper.py --check [--root .]           # report cache freshness
+    python3 scoper.py --scope "fix the header button" [--root .] [--max 5]
+    python3 scoper.py --build-index [--root .]
+    python3 scoper.py --check [--root .]
 
-    Flags to disable individual signals (useful for debugging/comparison):
-        --no-symbols          disable symbol-index matching
-        --no-git-boost        disable git-hot recency boost
-        --no-session-memory   disable session-memory boost & logging
-        --no-import-graph     disable related_files expansion
-        --no-monorepo         disable cross-package penalty
-        --no-token-warnings   disable token-budget estimate/warnings
+    Optional flags:
+        --no-symbols           disable symbol-index matching
+        --no-git-boost         disable git-hot recency boost
+        --no-session-memory    disable session-memory boost & logging
+        --no-import-graph      disable related_files expansion
+        --no-monorepo          disable cross-package penalty
+        --no-token-warnings    disable token-budget estimate/warnings
+        --scope-dir PATH       restrict search to a subdirectory
 
 Output (stdout, JSON):
     {
@@ -60,7 +52,8 @@ Output (stdout, JSON):
       "candidates": ["src/components/Header.jsx", ...],
       "related_files": ["src/components/Button.jsx", ...],
       "token_estimate": {"src/components/Header.jsx": 812, ...},
-      "warnings": ["..."]
+      "warnings": ["..."],
+      "scope_dir": null
     }
 """
 
@@ -71,6 +64,9 @@ import os
 import re
 import subprocess
 import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+# --- Constants ---------------------------------------------------------------
 
 CACHE_DIRNAME = ".scoper_cache"
 CACHE_FILENAME = "tree_index.json"
@@ -79,29 +75,28 @@ SESSION_LOG_MAX_ENTRIES = 20
 SESSION_SIMILARITY_THRESHOLD = 0.55
 SESSION_BOOST = 0.12
 
-# Fallback ignore list, only used when project has no .git (git ls-files
-# already respects .gitignore automatically, so this list is intentionally
-# small — it's a safety net, not the primary filter).
-FALLBACK_IGNORE_DIRS = {
+FALLBACK_IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", "dist", "build", ".next", ".cache",
     "venv", ".venv", "__pycache__", ".scoper_cache",
 }
 
-# Extensions worth scanning for symbols/imports. Kept small and cheap on
-# purpose — this is regex-based, not a real parser.
-CODE_EXTENSIONS = {
-    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
-    ".py", ".go", ".rb", ".php", ".java", ".astro",
+CODE_EXTENSIONS: Set[str] = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".vue", ".svelte", ".astro",
+    ".py", ".go", ".rb", ".php", ".java",
+    ".rs", ".kt", ".cs", ".swift", ".dart",
 }
 
-JS_LIKE_EXTENSIONS = {
-    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte", ".astro",
+JS_LIKE_EXTENSIONS: Set[str] = {
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".vue", ".svelte", ".astro",
 }
 
-# Cap how much of a file we read for symbol/import extraction. Most
-# declarations worth matching live near the top; this keeps indexing fast
-# on huge files.
+# Cap how much of a file we read for symbol/import extraction.
 CODE_SCAN_BYTE_LIMIT = 20_000
+
+# Number of bytes to check for binary detection.
+BINARY_CHECK_BYTES = 1024
 
 SYMBOL_PATTERNS = [
     # JS/TS/JSX/TSX/Vue/Svelte/Astro-ish declarations
@@ -116,6 +111,30 @@ SYMBOL_PATTERNS = [
     re.compile(r"\bclass\s+([A-Za-z_][\w]*)\s*[:\(]"),
     # Go
     re.compile(r"\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_][\w]*)\s*\("),
+    # Rust
+    re.compile(r"\b(?:pub\s+)?fn\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\b(?:pub\s+)?struct\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\b(?:pub\s+)?(?:trait|enum|union)\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\b(?:pub\s+)?impl\s+(?:<[^>]*>\s+)?([A-Za-z_][\w]*)"),
+    # Kotlin
+    re.compile(r"\bfun\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\bclass\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\b(?:data|sealed|open|abstract)\s+class\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\bobject\s+([A-Za-z_][\w]*)"),
+    # C#
+    re.compile(r"\bclass\s+([A-Za-z_][\w]*)\s*(?::|{)"),
+    re.compile(r"\b(?:void|int|string|bool|Task|Task<[^>]*>|IActionResult)\s+([A-Za-z_][\w]*)\s*\("),
+    re.compile(r"\benum\s+([A-Za-z_][\w]*)"),
+    # Swift
+    re.compile(r"\bfunc\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\bclass\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\bstruct\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\bprotocol\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\benum\s+([A-Za-z_][\w]*)"),
+    # Dart
+    re.compile(r"\bclass\s+([A-Za-z_][\w]*)"),
+    re.compile(r"\b(?:void|int|String|bool|double|Future|Stream)\s+([A-Za-z_][\w]*)\s*\("),
+    re.compile(r"\bWidget\s+([A-Za-z_][\w]*)\s*\("),
 ]
 
 IMPORT_PATTERNS_JS = [
@@ -127,26 +146,57 @@ IMPORT_PATTERNS_PY = [
     re.compile(r"^\s*from\s+([\.\w]+)\s+import", re.MULTILINE),
     re.compile(r"^\s*import\s+([\.\w]+)", re.MULTILINE),
 ]
+IMPORT_PATTERNS_GO = [
+    re.compile(r'\bimport\s+(?:\w+\s+)?\x22([^\x22]+)\x22'),
+    re.compile(r'^\s+\x22([^\x22]+)\x22', re.MULTILINE),
+]
+IMPORT_PATTERNS_RUST = [
+    re.compile(r'\buse\s+([^;]+)'),
+    re.compile(r'\bmod\s+([a-zA-Z_][\w]*)'),
+]
+IMPORT_PATTERNS_RUBY = [
+    re.compile(r"require\s+['\"]([^'\"]+)['\"]"),
+    re.compile(r"require_relative\s+['\"]([^'\"]+)['\"]"),
+]
+IMPORT_PATTERNS_PHP = [
+    re.compile(r'\buse\s+([^;]+)'),
+    re.compile(r"require_once\s+['\"]([^'\"]+)['\"]"),
+    re.compile(r"include(?:_once)?\s+['\"]([^'\"]+)['\"]"),
+]
+IMPORT_PATTERNS_JAVA = [
+    re.compile(r'^\s*import\s+([^;]+)', re.MULTILINE),
+]
 
-# Resolution suffixes tried when turning a relative JS import ("./Button")
-# into an actual project file path.
+# Resolution suffixes for JS-like imports.
 JS_RESOLUTION_SUFFIXES = [
     "", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".vue", ".svelte",
     "/index.js", "/index.jsx", "/index.ts", "/index.tsx",
 ]
 
-# Marker files used to detect package/workspace boundaries in a monorepo.
-PACKAGE_MARKER_FILES = {
+# Marker files used to detect package/workspace boundaries.
+PACKAGE_MARKER_FILES: Set[str] = {
     "package.json", "pyproject.toml", "go.mod", "Cargo.toml", "composer.json",
 }
 
-# Token-budget thresholds (rough heuristic: ~4 chars per token).
+# Token-budget thresholds (~4 chars per token heuristic).
 CHARS_PER_TOKEN_ESTIMATE = 4
 TOKEN_WARN_FILE_THRESHOLD = 2000
 TOKEN_WARN_TOTAL_THRESHOLD = 6000
 
+# Default config values.
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "max_results": 5,
+    "min_score": 0.45,
+    "ignore_patterns": [],
+    "extra_code_extensions": [],
+}
 
-def run_git(args, cwd):
+RUST_STDLIB_PREFIXES = {"std::", "core::", "alloc::"}
+
+
+# --- Git helpers -------------------------------------------------------------
+
+def run_git(args: List[str], cwd: str) -> Optional[str]:
     try:
         result = subprocess.run(
             ["git"] + args,
@@ -162,15 +212,11 @@ def run_git(args, cwd):
         return None
 
 
-def is_git_repo(root):
+def is_git_repo(root: str) -> bool:
     return run_git(["rev-parse", "--is-inside-work-tree"], root) is not None
 
 
-def git_fingerprint(root):
-    """
-    Cheap fingerprint of repo state: HEAD commit hash + dirty file count.
-    Good enough to detect 'something changed' without hashing file contents.
-    """
+def git_fingerprint(root: str) -> Optional[str]:
     head = run_git(["rev-parse", "HEAD"], root)
     status = run_git(["status", "--porcelain"], root)
     if head is None:
@@ -179,22 +225,12 @@ def git_fingerprint(root):
     return f"{head.strip()}:{dirty_count}"
 
 
-def _is_scoper_internal(rel_path):
-    """
-    The scoper's own cache/log directory should never appear as a
-    candidate, regardless of whether the project's .gitignore happens to
-    exclude it (a fresh project may not have that entry yet).
-    """
+def _is_scoper_internal(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
     return normalized == CACHE_DIRNAME or normalized.startswith(CACHE_DIRNAME + "/")
 
 
-def list_files_git(root):
-    """
-    Uses `git ls-files` which is inherently .gitignore-aware.
-    Includes tracked files + untracked-but-not-ignored files, so new
-    files you just created still show up before the first commit.
-    """
+def list_files_git(root: str) -> List[str]:
     tracked = run_git(["ls-files"], root) or ""
     untracked = run_git(
         ["ls-files", "--others", "--exclude-standard"], root
@@ -203,41 +239,89 @@ def list_files_git(root):
     return sorted(f for f in files if f and not _is_scoper_internal(f))
 
 
-def list_files_fallback(root):
-    """
-    Plain os.walk fallback for non-git projects. No .gitignore to read,
-    so we rely on FALLBACK_IGNORE_DIRS as a basic noise filter.
-    """
-    results = []
+def parse_gitignore_patterns(root: str) -> List[str]:
+    gitignore_path = os.path.join(root, ".gitignore")
+    if not os.path.exists(gitignore_path):
+        return []
+    patterns: List[str] = []
+    try:
+        with open(gitignore_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    patterns.append(line)
+    except OSError:
+        pass
+    return patterns
+
+
+def list_files_fallback(root: str) -> List[str]:
+    gitignore_patterns = parse_gitignore_patterns(root)
+    results: List[str] = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in FALLBACK_IGNORE_DIRS]
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in FALLBACK_IGNORE_DIRS
+        ]
         for fname in filenames:
             full = os.path.join(dirpath, fname)
             rel = os.path.relpath(full, root)
-            if not _is_scoper_internal(rel):
-                results.append(rel)
+            if _is_scoper_internal(rel):
+                continue
+            if gitignore_patterns:
+                matched = False
+                for pat in gitignore_patterns:
+                    if pat.endswith("/"):
+                        if rel.startswith(pat) or rel.startswith(pat[:-1]):
+                            matched = True
+                            break
+                    else:
+                        if fnmatch_glob(rel, pat):
+                            matched = True
+                            break
+                if matched:
+                    continue
+            results.append(rel)
     return sorted(results)
 
 
-def git_hot_files(root):
-    """
-    Returns {path: weight} for recently-touched files:
-      - staged/unstaged changes right now  -> weight 1.0
-      - touched in the last 5 commits      -> weight decaying 0.6 -> 0.2
+def fnmatch_glob(path: str, pattern: str) -> bool:
+    """Simple glob-like matching for .gitignore patterns."""
+    if pattern.startswith("/"):
+        pattern = pattern[1:]
+    if "*" in pattern:
+        parts = pattern.split("*")
+        if len(parts) == 2:
+            if parts[0] and parts[1]:
+                return path.startswith(parts[0]) and path.endswith(parts[1])
+            elif parts[0]:
+                return path.startswith(parts[0])
+            elif parts[1]:
+                return path.endswith(parts[1])
+            return True
+    return path == pattern
 
-    This is a *ranking nudge*, not a filter — it only ever applies to
-    files that already cleared the base relevance threshold elsewhere.
-    """
+
+def is_binary_file(root: str, rel_path: str) -> bool:
+    full_path = os.path.join(root, rel_path)
+    try:
+        with open(full_path, "rb") as f:
+            chunk = f.read(BINARY_CHECK_BYTES)
+    except OSError:
+        return False
+    return b"\0" in chunk
+
+
+def git_hot_files(root: str) -> Dict[str, float]:
     if not is_git_repo(root):
         return {}
 
-    weights = {}
+    weights: Dict[str, float] = {}
 
     dirty = run_git(["status", "--porcelain"], root) or ""
     for line in dirty.splitlines():
         if not line:
             continue
-        # porcelain format: "XY path" (rename shows "old -> new")
         path = line[3:].split(" -> ")[-1].strip()
         if path:
             weights[path] = 1.0
@@ -256,7 +340,9 @@ def git_hot_files(root):
     return weights
 
 
-def cache_paths(root):
+# --- Cache operations --------------------------------------------------------
+
+def cache_paths(root: str) -> Tuple[str, str, str]:
     cache_dir = os.path.join(root, CACHE_DIRNAME)
     return (
         cache_dir,
@@ -265,7 +351,7 @@ def cache_paths(root):
     )
 
 
-def load_cache(root):
+def load_cache(root: str) -> Optional[Dict[str, Any]]:
     _, cache_file, _ = cache_paths(root)
     if not os.path.exists(cache_file):
         return None
@@ -276,39 +362,64 @@ def load_cache(root):
         return None
 
 
-def save_cache(root, data):
+def save_cache(root: str, data: Dict[str, Any]) -> None:
     cache_dir, cache_file, _ = cache_paths(root)
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_file, "w") as f:
         json.dump(data, f, indent=2)
 
 
-def is_cache_fresh(root, cached):
+def is_cache_fresh(root: str, cached: Optional[Dict[str, Any]]) -> bool:
     if cached is None:
         return False
 
     if is_git_repo(root):
         current_fp = git_fingerprint(root)
-        # If git fingerprint is available, it's the source of truth.
         if current_fp is not None:
             return cached.get("git_fingerprint") == current_fp
 
-    # Fallback: mtime-based. Consider stale after 5 minutes.
     cached_at = cached.get("built_at", 0)
     max_age_seconds = 5 * 60
     return (time.time() - cached_at) < max_age_seconds
 
 
-# --- Symbol + import extraction (single read pass per file) ---------------
+# --- Config file support -----------------------------------------------------
 
-def analyze_file(root, rel_path):
-    """
-    Single-read analysis of a file: extracts both declared symbols
-    (functions/classes/components) and raw import/require targets.
-    Combined into one function so we don't read the same file twice.
-    """
+def load_config(root: str) -> Dict[str, Any]:
+    config = dict(DEFAULT_CONFIG)
+
+    global_path = os.path.expanduser("~/.scoperrc")
+    if os.path.exists(global_path):
+        try:
+            with open(global_path, "r") as f:
+                global_cfg = json.load(f)
+                if isinstance(global_cfg, dict):
+                    config.update(global_cfg)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    project_path = os.path.join(root, ".scoperrc")
+    if os.path.exists(project_path):
+        try:
+            with open(project_path, "r") as f:
+                project_cfg = json.load(f)
+                if isinstance(project_cfg, dict):
+                    config.update(project_cfg)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return config
+
+
+# --- Symbol + import extraction -----------------------------------------------
+
+def analyze_file(root: str, rel_path: str) -> Tuple[List[str], List[str], Optional[str]]:
     ext = os.path.splitext(rel_path)[1].lower()
+
     if ext not in CODE_EXTENSIONS:
+        return [], [], None
+
+    if is_binary_file(root, rel_path):
         return [], [], None
 
     full_path = os.path.join(root, rel_path)
@@ -318,13 +429,14 @@ def analyze_file(root, rel_path):
     except OSError:
         return [], [], None
 
-    symbols = set()
+    symbols: Set[str] = set()
     for pattern in SYMBOL_PATTERNS:
         for match in pattern.finditer(content):
             symbols.add(match.group(1))
 
-    raw_imports = []
-    import_kind = None
+    raw_imports: List[str] = []
+    import_kind: Optional[str] = None
+
     if ext in JS_LIKE_EXTENSIONS:
         import_kind = "js"
         for pattern in IMPORT_PATTERNS_JS:
@@ -333,14 +445,35 @@ def analyze_file(root, rel_path):
         import_kind = "py"
         for pattern in IMPORT_PATTERNS_PY:
             raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".go":
+        import_kind = "go"
+        for pattern in IMPORT_PATTERNS_GO:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".rs":
+        import_kind = "rust"
+        for pattern in IMPORT_PATTERNS_RUST:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".rb":
+        import_kind = "ruby"
+        for pattern in IMPORT_PATTERNS_RUBY:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".php":
+        import_kind = "php"
+        for pattern in IMPORT_PATTERNS_PHP:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
+    elif ext == ".java":
+        import_kind = "java"
+        for pattern in IMPORT_PATTERNS_JAVA:
+            raw_imports.extend(m.group(1) for m in pattern.finditer(content))
 
     return sorted(symbols), raw_imports, import_kind
 
 
-def resolve_js_import(importer_rel_path, raw_import, files_set):
-    """Resolves a relative JS/TS import ('./Button') to a real project
-    file path. Skips bare package imports (e.g. 'react') since those
-    aren't part of the project and can't be scoped to."""
+# --- Import resolvers --------------------------------------------------------
+
+def resolve_js_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
     if not raw_import.startswith("."):
         return None
 
@@ -355,15 +488,16 @@ def resolve_js_import(importer_rel_path, raw_import, files_set):
     return None
 
 
-def resolve_python_import(importer_rel_path, raw_import, files_set):
-    """Best-effort resolution of a Python import to a project file path.
-    Handles simple relative ('.module') and absolute ('package.module')
-    forms; does not fully replicate Python's import machinery."""
+def resolve_python_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
     importer_dir = os.path.dirname(importer_rel_path)
 
     if raw_import.startswith("."):
         parts = [p for p in raw_import.lstrip(".").split(".") if p]
-        base = os.path.normpath(os.path.join(importer_dir, *parts)) if parts else importer_dir
+        base = os.path.normpath(
+            os.path.join(importer_dir, *parts)
+        ) if parts else importer_dir
     else:
         parts = raw_import.split(".")
         base = os.path.normpath(os.path.join(*parts))
@@ -376,34 +510,155 @@ def resolve_python_import(importer_rel_path, raw_import, files_set):
     return None
 
 
-def build_import_graph(root, files):
-    """
-    Returns (imports_forward, importers_reverse):
-      imports_forward[file]  = list of files it imports (resolved, exist in project)
-      importers_reverse[file] = list of files that import it
-    Only includes edges we could actually resolve to a real project file —
-    external package imports (react, lodash, etc.) are not part of the graph.
-    """
+def resolve_go_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
+    if "/" not in raw_import:
+        return None
+    candidate = raw_import + ".go"
+    if candidate in files_set:
+        return candidate
+    candidate2 = raw_import + "/index.go"
+    if candidate2 in files_set:
+        return candidate2
+    return None
+
+
+RUST_SOURCE_DIRS = ["", "src/", "lib/"]
+
+
+def resolve_rust_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
+    # Skip stdlib-looking prefixes (std, core, alloc).
+    if any(raw_import.startswith(p) for p in RUST_STDLIB_PREFIXES):
+        return None
+
+    parts = raw_import.split("::")
+    if not parts:
+        return None
+
+    if parts[0] in ("crate", "self"):
+        parts = parts[1:]
+    elif parts[0] == "super":
+        importer_dir = os.path.dirname(importer_rel_path)
+        parts = parts[1:]
+        if not parts:
+            return None
+        path = os.path.normpath(
+            os.path.join(importer_dir, *parts)
+        ).replace(os.sep, "/")
+        for suffix in [".rs", "/mod.rs"]:
+            c = path + suffix
+            if c in files_set:
+                return c
+        return None
+
+    if not parts:
+        return None
+
+    path = os.path.join(*parts).replace(os.sep, "/")
+    for suffix in [".rs", "/mod.rs"]:
+        for source_dir in RUST_SOURCE_DIRS:
+            c = source_dir + path + suffix
+            if c in files_set:
+                return c
+    return None
+
+
+def resolve_ruby_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
+    if raw_import.startswith("."):
+        importer_dir = os.path.dirname(importer_rel_path)
+        base = os.path.normpath(
+            os.path.join(importer_dir, raw_import)
+        ).replace(os.sep, "/")
+        c = base + ".rb"
+        if c in files_set:
+            return c
+        c2 = base + "/index.rb"
+        if c2 in files_set:
+            return c2
+        return None
+
+    c = raw_import + ".rb"
+    if c in files_set:
+        return c
+    return None
+
+
+PHP_SOURCE_DIRS = ["", "src/", "lib/", "app/"]
+
+
+def resolve_php_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
+    if raw_import.startswith(".") or "/" in raw_import:
+        importer_dir = os.path.dirname(importer_rel_path)
+        base = os.path.normpath(
+            os.path.join(importer_dir, raw_import)
+        ).replace(os.sep, "/")
+        for suffix in ["", ".php"]:
+            c = base + suffix
+            if c in files_set:
+                return c
+        return None
+
+    path = raw_import.replace("\\", "/") + ".php"
+    for source_dir in PHP_SOURCE_DIRS:
+        c = source_dir + path
+        if c in files_set:
+            return c
+    return None
+
+
+def resolve_java_import(
+    importer_rel_path: str, raw_import: str, files_set: Set[str]
+) -> Optional[str]:
+    if raw_import.endswith(".*"):
+        return None
+    path = raw_import.replace(".", "/") + ".java"
+    if path in files_set:
+        return path
+    return None
+
+
+# --- Graph building ----------------------------------------------------------
+
+def build_import_graph(
+    root: str, files: List[str]
+) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     files_set = set(files)
-    imports_forward = {}
+    imports_forward: Dict[str, List[str]] = {}
 
     for rel_path in files:
         _symbols, raw_imports, kind = analyze_file(root, rel_path)
         if not raw_imports:
             continue
-        resolved = set()
+        resolved: Set[str] = set()
         for raw in raw_imports:
-            target = None
+            target: Optional[str] = None
             if kind == "js":
                 target = resolve_js_import(rel_path, raw, files_set)
             elif kind == "py":
                 target = resolve_python_import(rel_path, raw, files_set)
+            elif kind == "go":
+                target = resolve_go_import(rel_path, raw, files_set)
+            elif kind == "rust":
+                target = resolve_rust_import(rel_path, raw, files_set)
+            elif kind == "ruby":
+                target = resolve_ruby_import(rel_path, raw, files_set)
+            elif kind == "php":
+                target = resolve_php_import(rel_path, raw, files_set)
+            elif kind == "java":
+                target = resolve_java_import(rel_path, raw, files_set)
             if target and target != rel_path:
                 resolved.add(target)
         if resolved:
             imports_forward[rel_path] = sorted(resolved)
 
-    importers_reverse = {}
+    importers_reverse: Dict[str, List[str]] = {}
     for src, targets in imports_forward.items():
         for tgt in targets:
             importers_reverse.setdefault(tgt, []).append(src)
@@ -411,8 +666,8 @@ def build_import_graph(root, files):
     return imports_forward, importers_reverse
 
 
-def build_symbol_index(root, files):
-    symbols = {}
+def build_symbol_index(root: str, files: List[str]) -> Dict[str, List[str]]:
+    symbols: Dict[str, List[str]] = {}
     for rel_path in files:
         syms, _raw_imports, _kind = analyze_file(root, rel_path)
         if syms:
@@ -420,16 +675,10 @@ def build_symbol_index(root, files):
     return symbols
 
 
-# --- Monorepo / package boundary detection ---------------------------------
+# --- Monorepo / package boundary detection -------------------------------------
 
-def detect_package_roots(files):
-    """
-    Returns a list of directories (relative to project root) that contain
-    a package marker file (package.json, pyproject.toml, etc.), sorted
-    longest-path-first so prefix matching finds the most specific root.
-    Always includes "." as the fallback root.
-    """
-    roots = {"."}
+def detect_package_roots(files: List[str]) -> List[str]:
+    roots: Set[str] = {"."}
     for f in files:
         base = os.path.basename(f)
         if base in PACKAGE_MARKER_FILES:
@@ -438,7 +687,7 @@ def detect_package_roots(files):
     return sorted(roots, key=lambda r: -len(r))
 
 
-def package_for_file(rel_path, sorted_roots):
+def package_for_file(rel_path: str, sorted_roots: List[str]) -> str:
     dirname = os.path.dirname(rel_path).replace(os.sep, "/")
     for root in sorted_roots:
         if root == ".":
@@ -448,9 +697,12 @@ def package_for_file(rel_path, sorted_roots):
     return "."
 
 
-# --- Index build/load -------------------------------------------------------
+# --- Index build/load ---------------------------------------------------------
 
-def build_index(root):
+def build_index(
+    root: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     if is_git_repo(root):
         files = list_files_git(root)
         fingerprint = git_fingerprint(root)
@@ -462,7 +714,7 @@ def build_index(root):
     imports_forward, importers_reverse = build_import_graph(root, files)
     package_roots = detect_package_roots(files)
 
-    data = {
+    data: Dict[str, Any] = {
         "built_at": time.time(),
         "git_fingerprint": fingerprint,
         "files": files,
@@ -475,16 +727,20 @@ def build_index(root):
     return data
 
 
-def get_index(root, force_rebuild=False):
+def get_index(
+    root: str,
+    force_rebuild: bool = False,
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], str]:
     cached = None if force_rebuild else load_cache(root)
     if cached is not None and is_cache_fresh(root, cached):
         return cached, "hit"
-    return build_index(root), "rebuilt"
+    return build_index(root, config), "rebuilt"
 
 
-# --- Session memory -------------------------------------------------------
+# --- Session memory -----------------------------------------------------------
 
-def load_session_log(root):
+def load_session_log(root: str) -> List[Dict[str, Any]]:
     _, _, log_file = cache_paths(root)
     if not os.path.exists(log_file):
         return []
@@ -495,21 +751,17 @@ def load_session_log(root):
         return []
 
 
-def save_session_log(root, log):
+def save_session_log(root: str, log: List[Dict[str, Any]]) -> None:
     cache_dir, _, log_file = cache_paths(root)
     os.makedirs(cache_dir, exist_ok=True)
     with open(log_file, "w") as f:
         json.dump(log[-SESSION_LOG_MAX_ENTRIES:], f, indent=2)
 
 
-def session_memory_boost(prompt, session_log):
-    """
-    Returns {path: boost} for files that appeared in prior prompts similar
-    to the current one. Boost is additive and capped small on purpose —
-    this nudges ranking for "lanjutin yang tadi" style follow-ups, it
-    never single-handedly qualifies a file as a candidate.
-    """
-    boosts = {}
+def session_memory_boost(
+    prompt: str, session_log: List[Dict[str, Any]]
+) -> Dict[str, float]:
+    boosts: Dict[str, float] = {}
     prompt_lower = prompt.lower()
     for entry in session_log:
         similarity = difflib.SequenceMatcher(
@@ -517,47 +769,32 @@ def session_memory_boost(prompt, session_log):
         ).ratio()
         if similarity >= SESSION_SIMILARITY_THRESHOLD:
             for path in entry.get("candidates", []):
-                boosts[path] = max(boosts.get(path, 0.0), SESSION_BOOST * similarity)
+                boosts[path] = max(
+                    boosts.get(path, 0.0), SESSION_BOOST * similarity
+                )
     return boosts
 
 
-# --- Matching ---------------------------------------------------------------
-
-STOPWORDS = {
+# --- Matching -----------------------------------------------------------------
+STOPWORDS: Set[str] = {
     "ubah", "ganti", "samain", "sama", "seperti", "kayak", "dengan",
     "di", "ke", "yang", "dan", "atau", "the", "a", "an", "for", "with",
     "like", "same", "as", "on", "in", "make", "change", "update",
 }
 
 
-def extract_keywords(prompt):
+def extract_keywords(prompt: str) -> List[str]:
     words = re.findall(r"[a-zA-Z0-9]+", prompt.lower())
     return [w for w in words if w not in STOPWORDS and len(w) > 2]
 
 
-def split_identifier(text):
-    """
-    Splits a filename, path, or symbol name into lowercase word tokens,
-    breaking on camelCase/PascalCase boundaries, underscores, dashes, and
-    path separators. e.g. "TopHeader" -> ["top", "header"],
-    "src/components/nav-bar.jsx" -> ["src", "components", "nav", "bar", "jsx"]
-    """
+def split_identifier(text: str) -> List[str]:
     text = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", text)
     text = re.sub(r"[_\-./]", " ", text)
     return [t for t in text.lower().split() if t]
 
 
-def text_match_score(text_lower, keywords):
-    """
-    Matches a piece of text (filename stem/path, or a symbol name) against
-    keywords using, in order of strength:
-      1. exact/substring match against a WORD TOKEN (e.g. keyword "header"
-         against tokens ["top", "header"] from "TopHeader") -> strong
-      2. substring match against the raw, unsplit text -> medium
-      3. difflib fuzzy ratio, but only above a high cutoff, to catch
-         near-miss typos/variants without matching on coincidental
-         character overlap between otherwise-unrelated short strings.
-    """
+def text_match_score(text_lower: str, keywords: List[str]) -> float:
     tokens = split_identifier(text_lower)
     best = 0.0
 
@@ -578,7 +815,13 @@ def text_match_score(text_lower, keywords):
     return best
 
 
-def score_file(path, keywords, symbols_for_file, hot_weight, session_boost):
+def score_file(
+    path: str,
+    keywords: List[str],
+    symbols_for_file: List[str],
+    hot_weight: float,
+    session_boost_val: float,
+) -> float:
     path_lower = path.lower()
     stem = os.path.splitext(os.path.basename(path_lower))[0]
 
@@ -589,35 +832,22 @@ def score_file(path, keywords, symbols_for_file, hot_weight, session_boost):
 
     symbol_score = 0.0
     for symbol in symbols_for_file:
-        symbol_score = max(symbol_score, text_match_score(symbol.lower(), keywords))
+        symbol_score = max(
+            symbol_score, text_match_score(symbol.lower(), keywords)
+        )
 
     base_score = max(filename_score, symbol_score)
 
-    # Git-hot boost and session boost only ever apply on top of a base
-    # score that already shows some independent relevance — this prevents
-    # an unrelated-but-recently-edited file from being surfaced by
-    # recency alone. Deliberately NOT clamped to 1.0: these scores are
-    # only used internally for ranking (never exposed in the output), so
-    # letting boosts push a score above 1.0 preserves useful tie-breaks
-    # between files with an identical base filename/symbol match (e.g.
-    # two same-named components in different packages).
     if base_score > 0:
         base_score += hot_weight * 0.15
-        base_score += session_boost
+        base_score += session_boost_val
 
     return base_score
 
 
-def apply_monorepo_penalty(scored, index):
-    """
-    If the project has more than one detected package root, candidates
-    living in a different package than the top-scoring candidate get a
-    ranking penalty (not exclusion) — reduces cross-package false
-    positives (e.g. a same-named component in a different app/package)
-    without discarding genuinely shared/cross-package files outright.
-    Only activates when the top score is confident enough to trust as an
-    anchor.
-    """
+def apply_monorepo_penalty(
+    scored: List[Tuple[str, float]], index: Dict[str, Any]
+) -> List[Tuple[str, float]]:
     package_roots = index.get("package_roots", ["."])
     if len(package_roots) <= 1 or not scored:
         return scored
@@ -627,7 +857,7 @@ def apply_monorepo_penalty(scored, index):
         return scored
 
     top_package = package_for_file(top_file, package_roots)
-    adjusted = []
+    adjusted: List[Tuple[str, float]] = []
     for f, score in scored:
         if score > 0 and package_for_file(f, package_roots) != top_package:
             score *= 0.6
@@ -635,18 +865,17 @@ def apply_monorepo_penalty(scored, index):
     return adjusted
 
 
-def expand_related_files(primary_files, index, max_related=3, per_file_neighbors=4):
-    """
-    1-hop import-graph expansion: direct imports and direct importers of
-    the primary candidates, surfaced as reference/context files rather
-    than primary edit targets (e.g. a shared Button/theme file that a
-    matched component imports).
-    """
+def expand_related_files(
+    primary_files: List[str],
+    index: Dict[str, Any],
+    max_related: int = 3,
+    per_file_neighbors: int = 4,
+) -> List[str]:
     imports_map = index.get("imports", {})
     importers_map = index.get("importers", {})
 
     seen = set(primary_files)
-    related = []
+    related: List[str] = []
     for f in primary_files:
         neighbors = (
             imports_map.get(f, [])[:per_file_neighbors]
@@ -662,7 +891,7 @@ def expand_related_files(primary_files, index, max_related=3, per_file_neighbors
     return related
 
 
-def estimate_tokens(root, rel_path):
+def estimate_tokens(root: str, rel_path: str) -> int:
     full_path = os.path.join(root, rel_path)
     try:
         size_bytes = os.path.getsize(full_path)
@@ -671,46 +900,58 @@ def estimate_tokens(root, rel_path):
     return size_bytes // CHARS_PER_TOKEN_ESTIMATE
 
 
-def build_token_report(root, files):
-    token_estimate = {f: estimate_tokens(root, f) for f in files}
-    warnings = []
+def build_token_report(
+    root: str, files: List[str]
+) -> Tuple[Dict[str, int], List[str]]:
+    token_estimate: Dict[str, int] = {
+        f: estimate_tokens(root, f) for f in files
+    }
+    warnings: List[str] = []
     for f, tokens in token_estimate.items():
         if tokens >= TOKEN_WARN_FILE_THRESHOLD:
             warnings.append(
-                f"{f} is ~{tokens} tokens — consider reading only the "
-                f"relevant section instead of the whole file."
+                f"{f} is ~{tokens} tokens \u2014 consider reading only "
+                f"the relevant section instead of the whole file."
             )
     total = sum(token_estimate.values())
     if total >= TOKEN_WARN_TOTAL_THRESHOLD:
         warnings.append(
             f"Total estimated context across candidates is ~{total} "
-            f"tokens — consider narrowing the prompt or working in "
-            f"smaller steps."
+            f"tokens \u2014 consider narrowing the prompt or working "
+            f"in smaller steps."
         )
     return token_estimate, warnings
 
 
 def match_candidates(
-    index,
-    prompt,
-    root,
-    max_results=5,
-    min_score=0.45,
-    use_symbols=True,
-    use_git_boost=True,
-    use_session_memory=True,
-    use_import_graph=True,
-    use_monorepo=True,
-    use_token_warnings=True,
-):
+    index: Dict[str, Any],
+    prompt: str,
+    root: str,
+    max_results: int = 5,
+    min_score: float = 0.45,
+    use_symbols: bool = True,
+    use_git_boost: bool = True,
+    use_session_memory: bool = True,
+    use_import_graph: bool = True,
+    use_monorepo: bool = True,
+    use_token_warnings: bool = True,
+    scope_dir: Optional[str] = None,
+) -> Dict[str, Any]:
     keywords = extract_keywords(prompt)
     if not keywords:
         return {
-            "candidates": [], "related_files": [],
-            "token_estimate": {}, "warnings": [],
+            "candidates": [],
+            "related_files": [],
+            "token_estimate": {},
+            "warnings": [],
         }
 
     files = index["files"]
+
+    if scope_dir:
+        scope_dir_normalized = scope_dir.replace(os.sep, "/").rstrip("/") + "/"
+        files = [f for f in files if f.startswith(scope_dir_normalized)]
+
     symbols_map = index.get("symbols", {}) if use_symbols else {}
     hot_files = git_hot_files(root) if use_git_boost else {}
 
@@ -719,7 +960,7 @@ def match_candidates(
         session_memory_boost(prompt, session_log) if use_session_memory else {}
     )
 
-    scored = []
+    scored: List[Tuple[str, float]] = []
     for f in files:
         score = score_file(
             f,
@@ -737,11 +978,11 @@ def match_candidates(
     scored.sort(key=lambda pair: pair[1], reverse=True)
     primary = [f for f, _ in scored[:max_results]]
 
-    related = []
+    related: List[str] = []
     if use_import_graph and primary:
         related = expand_related_files(primary, index)
 
-    token_estimate, warnings = ({}, [])
+    token_estimate, warnings = {}, []
     if use_token_warnings:
         token_estimate, warnings = build_token_report(root, primary + related)
 
@@ -761,30 +1002,52 @@ def match_candidates(
     }
 
 
-# --- CLI ---------------------------------------------------------------------
+# --- CLI -----------------------------------------------------------------------
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=".", help="Project root directory")
     parser.add_argument("--scope", help="Prompt/instruction to scope files for")
-    parser.add_argument("--build-index", action="store_true",
-                         help="Force rebuild the cache")
-    parser.add_argument("--check", action="store_true",
-                         help="Just report cache freshness, no scoping")
-    parser.add_argument("--max", type=int, default=5,
-                         help="Max candidate files to return (default 5)")
-    parser.add_argument("--no-symbols", action="store_true",
-                         help="Disable symbol-index matching")
-    parser.add_argument("--no-git-boost", action="store_true",
-                         help="Disable git-hot recency boost")
-    parser.add_argument("--no-session-memory", action="store_true",
-                         help="Disable session-memory boost & logging")
-    parser.add_argument("--no-import-graph", action="store_true",
-                         help="Disable related_files expansion via import graph")
-    parser.add_argument("--no-monorepo", action="store_true",
-                         help="Disable cross-package ranking penalty")
-    parser.add_argument("--no-token-warnings", action="store_true",
-                         help="Disable token-budget estimate/warnings")
+    parser.add_argument(
+        "--build-index", action="store_true",
+        help="Force rebuild the cache",
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help="Just report cache freshness, no scoping",
+    )
+    parser.add_argument(
+        "--max", type=int, default=5,
+        help="Max candidate files to return (default 5)",
+    )
+    parser.add_argument(
+        "--no-symbols", action="store_true",
+        help="Disable symbol-index matching",
+    )
+    parser.add_argument(
+        "--no-git-boost", action="store_true",
+        help="Disable git-hot recency boost",
+    )
+    parser.add_argument(
+        "--no-session-memory", action="store_true",
+        help="Disable session-memory boost & logging",
+    )
+    parser.add_argument(
+        "--no-import-graph", action="store_true",
+        help="Disable related_files expansion via import graph",
+    )
+    parser.add_argument(
+        "--no-monorepo", action="store_true",
+        help="Disable cross-package ranking penalty",
+    )
+    parser.add_argument(
+        "--no-token-warnings", action="store_true",
+        help="Disable token-budget estimate/warnings",
+    )
+    parser.add_argument(
+        "--scope-dir",
+        help="Restrict search to a subdirectory (relative to --root)",
+    )
     args = parser.parse_args()
 
     root = os.path.abspath(args.root)
@@ -796,21 +1059,34 @@ def main():
             "cache_exists": cached is not None,
             "cache_fresh": fresh,
             "total_files_indexed": len(cached["files"]) if cached else 0,
-            "total_files_with_symbols": len(cached.get("symbols", {})) if cached else 0,
-            "total_files_with_imports": len(cached.get("imports", {})) if cached else 0,
-            "package_roots": cached.get("package_roots", ["."]) if cached else ["."],
+            "total_files_with_symbols": (
+                len(cached.get("symbols", {})) if cached else 0
+            ),
+            "total_files_with_imports": (
+                len(cached.get("imports", {})) if cached else 0
+            ),
+            "package_roots": (
+                cached.get("package_roots", ["."]) if cached else ["."]
+            ),
         }, indent=2))
         return
 
-    index, cache_status = get_index(root, force_rebuild=args.build_index)
+    config = load_config(root)
+    index, cache_status = get_index(
+        root, force_rebuild=args.build_index, config=config
+    )
 
-    result = {
+    max_results = args.max or config.get("max_results", 5)
+    min_score = float(config.get("min_score", 0.45))
+
+    result: Dict[str, Any] = {
         "cache_status": cache_status,
         "total_files_indexed": len(index["files"]),
         "candidates": [],
         "related_files": [],
         "token_estimate": {},
         "warnings": [],
+        "scope_dir": args.scope_dir,
     }
 
     if args.scope:
@@ -818,13 +1094,15 @@ def main():
             index,
             args.scope,
             root,
-            max_results=args.max,
+            max_results=max_results,
+            min_score=min_score,
             use_symbols=not args.no_symbols,
             use_git_boost=not args.no_git_boost,
             use_session_memory=not args.no_session_memory,
             use_import_graph=not args.no_import_graph,
             use_monorepo=not args.no_monorepo,
             use_token_warnings=not args.no_token_warnings,
+            scope_dir=args.scope_dir,
         ))
 
     print(json.dumps(result, indent=2))
