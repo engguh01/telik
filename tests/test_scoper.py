@@ -480,6 +480,75 @@ class TestResolveGoImport(unittest.TestCase):
         )
         self.assertEqual(result, "pkg/util/helper.go")
 
+    def test_with_module_prefix(self):
+        files = {"src/util/helpers.go"}
+        module_name = "github.com/user/repo"
+        result = scoper.resolve_go_import(
+            "main.go", "github.com/user/repo/src/util/helpers",
+            files, module_name,
+        )
+        self.assertEqual(result, "src/util/helpers.go")
+
+    def test_with_module_prefix_no_match(self):
+        files = {"pkg/lib.go"}
+        module_name = "github.com/user/repo"
+        result = scoper.resolve_go_import(
+            "main.go", "github.com/other/pkg/lib",
+            files, module_name,
+        )
+        self.assertIsNone(result)
+
+    def test_module_prefix_fallback_to_exact(self):
+        files = {"vendor/x/y.go"}
+        # Module prefix doesn't match, falls back to exact match
+        module_name = "example.com/app"
+        result = scoper.resolve_go_import(
+            "main.go", "vendor/x/y", files, module_name,
+        )
+        self.assertEqual(result, "vendor/x/y.go")
+
+
+class TestGetGoModuleName(unittest.TestCase):
+    def test_reads_module_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "go.mod"), "w") as f:
+                f.write("module github.com/user/repo\n\ngo 1.21\n")
+            result = scoper.get_go_module_name(tmp)
+            self.assertEqual(result, "github.com/user/repo")
+
+    def test_no_go_mod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = scoper.get_go_module_name(tmp)
+            self.assertIsNone(result)
+
+    def test_empty_go_mod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "go.mod"), "w") as f:
+                f.write("")
+            result = scoper.get_go_module_name(tmp)
+            self.assertIsNone(result)
+
+
+class TestAnalyzeFileExtraExtensions(unittest.TestCase):
+    def test_extra_extension_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "test.gql")
+            with open(path, "w") as f:
+                f.write("function foo() {}")
+            symbols, imports, kind = scoper.analyze_file(
+                tmp, "test.gql", extra_extensions={".gql"}
+            )
+            self.assertIn("foo", symbols)
+
+    def test_unknown_extension_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "test.gql")
+            with open(path, "w") as f:
+                f.write("function foo() {}")
+            symbols, imports, kind = scoper.analyze_file(tmp, "test.gql")
+            self.assertEqual(symbols, [])
+
+
 
 class TestResolveRustImport(unittest.TestCase):
     def test_crate_path(self):

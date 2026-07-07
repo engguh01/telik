@@ -417,10 +417,15 @@ def load_config(root: str) -> Dict[str, Any]:
 
 # --- Symbol + import extraction -----------------------------------------------
 
-def analyze_file(root: str, rel_path: str) -> Tuple[List[str], List[str], Optional[str]]:
+def analyze_file(
+    root: str,
+    rel_path: str,
+    extra_extensions: Optional[Set[str]] = None,
+) -> Tuple[List[str], List[str], Optional[str]]:
     ext = os.path.splitext(rel_path)[1].lower()
+    exts = CODE_EXTENSIONS | (extra_extensions or set())
 
-    if ext not in CODE_EXTENSIONS:
+    if ext not in exts:
         return [], [], None
 
     if is_binary_file(root, rel_path):
@@ -514,17 +519,39 @@ def resolve_python_import(
     return None
 
 
+def get_go_module_name(root: str) -> Optional[str]:
+    """Read the module path from go.mod, if present."""
+    mod_path = os.path.join(root, "go.mod")
+    if not os.path.exists(mod_path):
+        return None
+    try:
+        with open(mod_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("module "):
+                    return line.split("module ", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
 def resolve_go_import(
-    importer_rel_path: str, raw_import: str, files_set: Set[str]
+    importer_rel_path: str,
+    raw_import: str,
+    files_set: Set[str],
+    module_name: Optional[str] = None,
 ) -> Optional[str]:
     if "/" not in raw_import:
         return None
-    candidate = raw_import + ".go"
-    if candidate in files_set:
-        return candidate
-    candidate2 = raw_import + "/index.go"
-    if candidate2 in files_set:
-        return candidate2
+
+    candidates = [raw_import + ".go", raw_import + "/index.go"]
+    if module_name and raw_import.startswith(module_name + "/"):
+        relative = raw_import[len(module_name) + 1:]
+        candidates.extend([relative + ".go", relative + "/index.go"])
+
+    for c in candidates:
+        if c in files_set:
+            return c
     return None
 
 
@@ -631,13 +658,16 @@ def resolve_java_import(
 # --- Graph building ----------------------------------------------------------
 
 def build_import_graph(
-    root: str, files: List[str]
+    root: str,
+    files: List[str],
+    extra_extensions: Optional[Set[str]] = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     files_set = set(files)
+    go_module_name = get_go_module_name(root)
     imports_forward: Dict[str, List[str]] = {}
 
     for rel_path in files:
-        _symbols, raw_imports, kind = analyze_file(root, rel_path)
+        _symbols, raw_imports, kind = analyze_file(root, rel_path, extra_extensions)
         if not raw_imports:
             continue
         resolved: Set[str] = set()
@@ -648,7 +678,7 @@ def build_import_graph(
             elif kind == "py":
                 target = resolve_python_import(rel_path, raw, files_set)
             elif kind == "go":
-                target = resolve_go_import(rel_path, raw, files_set)
+                target = resolve_go_import(rel_path, raw, files_set, go_module_name)
             elif kind == "rust":
                 target = resolve_rust_import(rel_path, raw, files_set)
             elif kind == "ruby":
@@ -670,10 +700,14 @@ def build_import_graph(
     return imports_forward, importers_reverse
 
 
-def build_symbol_index(root: str, files: List[str]) -> Dict[str, List[str]]:
+def build_symbol_index(
+    root: str,
+    files: List[str],
+    extra_extensions: Optional[Set[str]] = None,
+) -> Dict[str, List[str]]:
     symbols: Dict[str, List[str]] = {}
     for rel_path in files:
-        syms, _raw_imports, _kind = analyze_file(root, rel_path)
+        syms, _raw_imports, _kind = analyze_file(root, rel_path, extra_extensions)
         if syms:
             symbols[rel_path] = syms
     return symbols
@@ -714,8 +748,23 @@ def build_index(
         files = list_files_fallback(root)
         fingerprint = None
 
-    symbols = build_symbol_index(root, files)
-    imports_forward, importers_reverse = build_import_graph(root, files)
+    if config and config.get("ignore_patterns"):
+        for pat in config["ignore_patterns"]:
+            pat = str(pat)
+            files = [
+                f for f in files
+                if not fnmatch_glob(f, pat) and not f.startswith(pat.rstrip("/"))
+            ]
+
+    extra_extensions: Optional[Set[str]] = None
+    if config and config.get("extra_code_extensions"):
+        extra_extensions = {
+            e if e.startswith(".") else "." + e
+            for e in config["extra_code_extensions"]
+        }
+
+    symbols = build_symbol_index(root, files, extra_extensions)
+    imports_forward, importers_reverse = build_import_graph(root, files, extra_extensions)
     package_roots = detect_package_roots(files)
 
     data: Dict[str, Any] = {
