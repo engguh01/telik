@@ -480,20 +480,73 @@ def analyze_file(
 
 # --- Import resolvers --------------------------------------------------------
 
+def get_path_aliases(root: str) -> Dict[str, str]:
+    """Read tsconfig.json or jsconfig.json for TypeScript path aliases."""
+    for config_name in ("tsconfig.json", "jsconfig.json"):
+        path = os.path.join(root, config_name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r") as f:
+                config = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        paths = config.get("compilerOptions", {}).get("paths", {})
+        if paths:
+            aliases: Dict[str, str] = {}
+            for alias, targets in paths.items():
+                key = alias.rstrip("/*")
+                target = targets[0].rstrip("/*") if targets else ""
+                aliases[key] = target
+            return aliases
+    return {}
+
+# Token frequency thresholds for common-path penalty.
+FREQUENCY_PENALTY_THRESHOLD = 0.3
+FREQUENCY_PENALTY_FACTOR = 0.85
+
+
+def compute_path_token_frequencies(files: List[str]) -> Dict[str, float]:
+    unique = list(set(files))
+    total = max(len(unique), 1)
+    token_counts: Dict[str, int] = {}
+    for f in unique:
+        seen: Set[str] = set()
+        for t in split_identifier(f.lower()):
+            if t not in seen:
+                token_counts[t] = token_counts.get(t, 0) + 1
+                seen.add(t)
+    return {t: c / total for t, c in token_counts.items()}
+
+
 def resolve_js_import(
-    importer_rel_path: str, raw_import: str, files_set: Set[str]
+    importer_rel_path: str,
+    raw_import: str,
+    files_set: Set[str],
+    aliases: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
-    if not raw_import.startswith("."):
+    if raw_import.startswith("."):
+        importer_dir = os.path.dirname(importer_rel_path)
+        base = os.path.normpath(os.path.join(importer_dir, raw_import))
+        base = base.replace(os.sep, "/")
+        for suffix in JS_RESOLUTION_SUFFIXES:
+            candidate = (base + suffix) if suffix else base
+            if candidate in files_set:
+                return candidate
         return None
 
-    importer_dir = os.path.dirname(importer_rel_path)
-    base = os.path.normpath(os.path.join(importer_dir, raw_import))
-    base = base.replace(os.sep, "/")
+    if aliases:
+        for alias_key, alias_target in sorted(aliases.items(), key=lambda x: -len(x[0])):
+            if raw_import == alias_key or raw_import.startswith(alias_key + "/"):
+                relative_path = raw_import[len(alias_key):].lstrip("/")
+                base = os.path.normpath(
+                    os.path.join(alias_target, relative_path)
+                ).replace(os.sep, "/")
+                for suffix in JS_RESOLUTION_SUFFIXES:
+                    candidate = (base + suffix) if suffix else base
+                    if candidate in files_set:
+                        return candidate
 
-    for suffix in JS_RESOLUTION_SUFFIXES:
-        candidate = (base + suffix) if suffix else base
-        if candidate in files_set:
-            return candidate
     return None
 
 
@@ -661,6 +714,7 @@ def build_import_graph(
     root: str,
     files: List[str],
     extra_extensions: Optional[Set[str]] = None,
+    aliases: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     files_set = set(files)
     go_module_name = get_go_module_name(root)
@@ -674,7 +728,7 @@ def build_import_graph(
         for raw in raw_imports:
             target: Optional[str] = None
             if kind == "js":
-                target = resolve_js_import(rel_path, raw, files_set)
+                target = resolve_js_import(rel_path, raw, files_set, aliases)
             elif kind == "py":
                 target = resolve_python_import(rel_path, raw, files_set)
             elif kind == "go":
@@ -764,8 +818,12 @@ def build_index(
         }
 
     symbols = build_symbol_index(root, files, extra_extensions)
-    imports_forward, importers_reverse = build_import_graph(root, files, extra_extensions)
+    aliases = get_path_aliases(root)
+    imports_forward, importers_reverse = build_import_graph(
+        root, files, extra_extensions, aliases
+    )
     package_roots = detect_package_roots(files)
+    token_frequencies = compute_path_token_frequencies(files)
 
     data: Dict[str, Any] = {
         "built_at": time.time(),
@@ -775,6 +833,7 @@ def build_index(
         "imports": imports_forward,
         "importers": importers_reverse,
         "package_roots": package_roots,
+        "token_frequencies": token_frequencies,
     }
     save_cache(root, data)
     return data
@@ -874,28 +933,70 @@ def score_file(
     symbols_for_file: List[str],
     hot_weight: float,
     session_boost_val: float,
-) -> float:
+    freq_map: Optional[Dict[str, float]] = None,
+) -> Tuple[float, int]:
     path_lower = path.lower()
     stem = os.path.splitext(os.path.basename(path_lower))[0]
 
-    filename_score = max(
-        text_match_score(stem, keywords),
-        text_match_score(path_lower, keywords),
-    )
+    stem_score = text_match_score(stem, keywords)
+    path_score = text_match_score(path_lower, keywords)
+    filename_score = max(stem_score, path_score)
+
+    # Frequency penalty: common path tokens reduce filename_score.
+    if freq_map and filename_score > 0:
+        path_tokens = set(split_identifier(path_lower))
+        matching_tokens = [kw for kw in keywords if kw in path_tokens]
+        if matching_tokens:
+            max_freq = max(freq_map.get(kw, 0.0) for kw in matching_tokens)
+            if max_freq > FREQUENCY_PENALTY_THRESHOLD:
+                filename_score *= max(FREQUENCY_PENALTY_FACTOR, 1.0 - max_freq)
 
     symbol_score = 0.0
+    symbol_hits = 0
     for symbol in symbols_for_file:
-        symbol_score = max(
-            symbol_score, text_match_score(symbol.lower(), keywords)
-        )
+        s = text_match_score(symbol.lower(), keywords)
+        if s > 0:
+            symbol_score = max(symbol_score, s)
+            symbol_hits += 1
+
+    # Symbol density boost: more matching symbols = higher relevance.
+    if symbol_hits > 1:
+        symbol_score = min(symbol_score + 0.03 * (symbol_hits - 1), 0.99)
 
     base_score = max(filename_score, symbol_score)
+
+    # Count keyword hits across both filename and symbols for tie-breaking.
+    path_hits = sum(1 for kw in keywords
+                    if text_match_score(path_lower, [kw]) > 0
+                    or text_match_score(stem, [kw]) > 0)
+    total_hits = path_hits + symbol_hits
 
     if base_score > 0:
         base_score += hot_weight * 0.15
         base_score += session_boost_val
+        base_score += 0.01 * min(total_hits, 10)
 
-    return base_score
+    return base_score, total_hits
+
+
+def apply_monorepo_penalty_scored(
+    scored: List[Tuple[str, float, int]], index: Dict[str, Any]
+) -> List[Tuple[str, float, int]]:
+    package_roots = index.get("package_roots", ["."])
+    if len(package_roots) <= 1 or not scored:
+        return scored
+
+    top_file, top_score, top_hits = max(scored, key=lambda pair: pair[1])
+    if top_score < 0.6:
+        return scored
+
+    top_package = package_for_file(top_file, package_roots)
+    adjusted: List[Tuple[str, float, int]] = []
+    for f, score, hits in scored:
+        if score > 0 and package_for_file(f, package_roots) != top_package:
+            score *= 0.6
+        adjusted.append((f, score, hits))
+    return adjusted
 
 
 def apply_monorepo_penalty(
@@ -1013,23 +1114,28 @@ def match_candidates(
         session_memory_boost(prompt, session_log) if use_session_memory else {}
     )
 
-    scored: List[Tuple[str, float]] = []
+    scored: List[Tuple[str, float, int]] = []
+    freq_map = index.get("token_frequencies", {})
     for f in files:
-        score = score_file(
+        score, hits = score_file(
             f,
             keywords,
             symbols_map.get(f, []),
             hot_files.get(f, 0.0),
             session_boosts.get(f, 0.0),
+            freq_map,
         )
-        scored.append((f, score))
+        scored.append((f, score, hits))
 
     if use_monorepo:
-        scored = apply_monorepo_penalty(scored, index)
+        scored = [
+            (f, s, h) for f, s, h in apply_monorepo_penalty_scored(scored, index)
+        ]
 
     scored = [pair for pair in scored if pair[1] >= min_score]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    primary = [f for f, _ in scored[:max_results]]
+    # Tie-break: higher score, then more keyword hits, then shorter path.
+    scored.sort(key=lambda pair: (pair[1], pair[2], -len(pair[0].split("/"))), reverse=True)
+    primary = [f for f, _, _ in scored[:max_results]]
 
     related: List[str] = []
     if use_import_graph and primary:

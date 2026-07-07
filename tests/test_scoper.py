@@ -86,28 +86,56 @@ class TestTextMatchScore(unittest.TestCase):
 
 class TestScoreFile(unittest.TestCase):
     def test_filename_match(self):
-        score = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
+        score, _ = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
         self.assertGreater(score, 0.0)
 
     def test_symbol_match(self):
-        score = scoper.score_file(
+        score, _ = scoper.score_file(
             "src/Nav.jsx", ["topheader"], ["TopHeader"], 0.0, 0.0
         )
         self.assertGreater(score, 0.0)
 
     def test_git_boost(self):
-        base = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
-        boosted = scoper.score_file("src/Header.jsx", ["header"], [], 1.0, 0.0)
+        base, _ = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
+        boosted, _ = scoper.score_file("src/Header.jsx", ["header"], [], 1.0, 0.0)
         self.assertGreater(boosted, base)
 
     def test_session_boost(self):
-        base = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
-        boosted = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.2)
+        base, _ = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.0)
+        boosted, _ = scoper.score_file("src/Header.jsx", ["header"], [], 0.0, 0.2)
         self.assertGreater(boosted, base)
 
     def test_no_boost_on_zero_base(self):
-        score = scoper.score_file("src/Foo.jsx", ["bar"], [], 1.0, 0.2)
+        score, _ = scoper.score_file("src/Foo.jsx", ["bar"], [], 1.0, 0.2)
         self.assertEqual(score, 0.0)
+
+    def test_frequency_penalty(self):
+        freq_map = {"page": 0.9, "header": 0.1}
+        score_penalized, _ = scoper.score_file(
+            "src/pages/page.tsx", ["page"], [], 0.0, 0.0, freq_map
+        )
+        score_raw, _ = scoper.score_file(
+            "src/pages/page.tsx", ["page"], [], 0.0, 0.0
+        )
+        self.assertLess(score_penalized, score_raw)
+
+    def test_symbol_density_boost(self):
+        symbols = ["handleAddProduct", "loadProducts", "deleteProduct"]
+        score_multi, hits = scoper.score_file(
+            "src/pos/page.tsx", ["add", "product"], symbols, 0.0, 0.0
+        )
+        score_single, _ = scoper.score_file(
+            "src/pos/page.tsx", ["add", "product"], ["handleAddProduct"], 0.0, 0.0
+        )
+        self.assertGreater(score_multi, score_single)
+        self.assertGreater(hits, 1)
+
+    def test_hit_count(self):
+        symbols = ["handleAddProduct", "createUser"]
+        _, hits = scoper.score_file(
+            "src/Test.tsx", ["product", "add"], symbols, 0.0, 0.0
+        )
+        self.assertGreaterEqual(hits, 1)
 
 
 class TestDetectPackageRoots(unittest.TestCase):
@@ -202,6 +230,37 @@ class TestResolveJsImport(unittest.TestCase):
             "src/pages/Page.jsx", "./components", files
         )
         self.assertEqual(result, "src/pages/components/index.jsx")
+
+    def test_alias_resolution(self):
+        aliases = {"@": "src"}
+        files = {"src/components/ui/button.tsx"}
+        result = scoper.resolve_js_import(
+            "src/pages/page.tsx", "@/components/ui/button", files, aliases
+        )
+        self.assertEqual(result, "src/components/ui/button.tsx")
+
+    def test_alias_nested_path(self):
+        aliases = {"@": "src"}
+        files = {"src/features/auth/login-form.tsx"}
+        result = scoper.resolve_js_import(
+            "src/app/page.tsx", "@/features/auth/login-form", files, aliases
+        )
+        self.assertEqual(result, "src/features/auth/login-form.tsx")
+
+    def test_alias_no_match(self):
+        aliases = {"@": "src"}
+        result = scoper.resolve_js_import(
+            "src/page.tsx", "@/missing/file", set(), aliases
+        )
+        self.assertIsNone(result)
+
+    def test_longest_alias_wins(self):
+        aliases = {"@/components": "src/shared", "@": "src"}
+        files = {"src/shared/ui/button.tsx"}
+        result = scoper.resolve_js_import(
+            "src/page.tsx", "@/components/ui/button", files, aliases
+        )
+        self.assertEqual(result, "src/shared/ui/button.tsx")
 
 
 class TestResolvePythonImport(unittest.TestCase):
@@ -653,6 +712,94 @@ class TestStopwords(unittest.TestCase):
     def test_english_stopwords(self):
         for w in ("the", "a", "an", "for", "in", "make", "change"):
             self.assertIn(w, scoper.STOPWORDS)
+
+
+class TestGetPathAliases(unittest.TestCase):
+    def test_reads_tsconfig_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tsconfig = {
+                "compilerOptions": {
+                    "paths": {
+                        "@/*": ["./src/*"],
+                        "~/*": ["./lib/*"],
+                    }
+                }
+            }
+            with open(os.path.join(tmp, "tsconfig.json"), "w") as f:
+                json.dump(tsconfig, f)
+            aliases = scoper.get_path_aliases(tmp)
+            self.assertEqual(aliases.get("@"), "./src")
+            self.assertEqual(aliases.get("~"), "./lib")
+
+    def test_no_tsconfig(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            aliases = scoper.get_path_aliases(tmp)
+            self.assertEqual(aliases, {})
+
+    def test_no_paths_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tsconfig = {"compilerOptions": {}}
+            with open(os.path.join(tmp, "tsconfig.json"), "w") as f:
+                json.dump(tsconfig, f)
+            aliases = scoper.get_path_aliases(tmp)
+            self.assertEqual(aliases, {})
+
+    def test_jsconfig_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jsconfig = {"compilerOptions": {"paths": {"@/*": ["./src/*"]}}}
+            with open(os.path.join(tmp, "jsconfig.json"), "w") as f:
+                json.dump(jsconfig, f)
+            aliases = scoper.get_path_aliases(tmp)
+            self.assertEqual(aliases.get("@"), "./src")
+
+
+class TestComputePathTokenFrequencies(unittest.TestCase):
+    def test_frequencies(self):
+        files = [
+            "src/app/page.tsx",
+            "src/app/layout.tsx",
+            "src/components/button.tsx",
+        ]
+        freqs = scoper.compute_path_token_frequencies(files)
+        self.assertAlmostEqual(freqs["page"], 1 / 3)
+        self.assertAlmostEqual(freqs["app"], 2 / 3)
+        self.assertAlmostEqual(freqs["src"], 3 / 3)
+
+    def test_empty_files(self):
+        freqs = scoper.compute_path_token_frequencies([])
+        self.assertEqual(freqs, {})
+
+    def test_duplicates_not_double_counted(self):
+        files = ["src/app/page.tsx", "src/app/page.tsx"]
+        freqs = scoper.compute_path_token_frequencies(files)
+        self.assertAlmostEqual(freqs["page"], 1.0)
+
+
+class TestApplyMonorepoPenaltyScored(unittest.TestCase):
+    def test_cross_package_penalty(self):
+        files = [
+            "package.json",
+            "packages/a/package.json",
+            "packages/b/package.json",
+            "packages/a/src/foo.js",
+            "packages/b/src/bar.js",
+        ]
+        roots = scoper.detect_package_roots(files)
+        index = {"package_roots": roots}
+        scored = [
+            ("packages/a/src/foo.js", 0.9, 3),
+            ("packages/b/src/bar.js", 0.7, 1),
+        ]
+        result = scoper.apply_monorepo_penalty_scored(scored, index)
+        self.assertEqual(result[0][0], "packages/a/src/foo.js")
+        _, score_b, _ = result[1]
+        self.assertAlmostEqual(score_b, 0.7 * 0.6)
+
+    def test_hits_preserved(self):
+        scored = [("a.js", 0.8, 5)]
+        index = {"package_roots": ["."]}
+        result = scoper.apply_monorepo_penalty_scored(scored, index)
+        self.assertEqual(result[0][2], 5)
 
 
 class TestCachePaths(unittest.TestCase):

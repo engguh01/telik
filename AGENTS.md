@@ -33,15 +33,18 @@ python3 -m unittest discover tests/               # run tests
 ## Architecture notes
 - `.gitignore`-aware via `git ls-files` (tracked + untracked-but-not-ignored)
 - Non-git fallback uses `os.walk` + parses `.gitignore` patterns via fnmatch-like matching
-- Fuzzy matching via stdlib `difflib` on filenames/paths — no import graph or dependency traversal
+- Fuzzy matching via stdlib `difflib` on filenames/paths and symbols
 - Symbol matching: regex-based extraction of function/class/component names inside files (JS/TS/Python/Go/Rust/Kotlin/C#/Swift/Dart)
 - Git-hot recency boost: staged/unstaged changes + last 5 commits get ranking nudge
 - Session memory: logs prompt→candidates in session_log.json for multi-turn continuity
-- Import graph: resolves JS/TS/Python/Go/Rust/Ruby/PHP/Java relative imports; 1-hop expansion surfaces related_files
+- Import graph: resolves JS/TS/Python/Go/Rust/Ruby/PHP/Java relative imports + TS path aliases (@/, ~/); 1-hop expansion surfaces related_files
 - Monorepo detection: scans for package.json/pyproject.toml/go.mod etc.; cross-package candidates penalized
 - Token warnings: rough size-based estimate (~4 chars/token), warns if per-file >2K or total >6K
 - Config file: ~/.scoperrc (global) and ./.scoperrc (project) JSON overrides
 - Binary detection: skips symbol/import extraction on files with null bytes in first 1KB
+- Score tie-breaking: secondary sort by keyword hit count, then path depth (shorter paths preferred)
+- Token frequency penalty: common path tokens (>30% of files) reduce filename match weight
+- Symbol density boost: files with multiple matching symbols get weighted higher
 - Output: JSON with `{cache_status, candidates, related_files, token_estimate, warnings, scope_dir, total_files_indexed}`
 
 ## Distinctions
