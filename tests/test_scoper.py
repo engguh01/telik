@@ -252,6 +252,9 @@ class TestIsScoperInternal(unittest.TestCase):
             scoper._is_scoper_internal("stuff/.scoper_cache/notreal")
         )
 
+    def test_scoperrc_is_internal(self):
+        self.assertTrue(scoper._is_scoper_internal(".scoperrc"))
+
 
 class TestApplyMonorepoPenalty(unittest.TestCase):
     def test_single_root_no_change(self):

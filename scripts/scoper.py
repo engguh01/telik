@@ -227,7 +227,11 @@ def git_fingerprint(root: str) -> Optional[str]:
 
 def _is_scoper_internal(rel_path: str) -> bool:
     normalized = rel_path.replace(os.sep, "/")
-    return normalized == CACHE_DIRNAME or normalized.startswith(CACHE_DIRNAME + "/")
+    if normalized == CACHE_DIRNAME or normalized.startswith(CACHE_DIRNAME + "/"):
+        return True
+    if normalized == ".scoperrc":
+        return True
+    return False
 
 
 def list_files_git(root: str) -> List[str]:
@@ -1017,8 +1021,12 @@ def main() -> None:
         help="Just report cache freshness, no scoping",
     )
     parser.add_argument(
-        "--max", type=int, default=5,
+        "--max", type=int, default=None,
         help="Max candidate files to return (default 5)",
+    )
+    parser.add_argument(
+        "--min-score", type=float, default=None,
+        help="Minimum similarity score threshold (default 0.45)",
     )
     parser.add_argument(
         "--no-symbols", action="store_true",
@@ -1076,8 +1084,9 @@ def main() -> None:
         root, force_rebuild=args.build_index, config=config
     )
 
-    max_results = args.max or config.get("max_results", 5)
-    min_score = float(config.get("min_score", 0.45))
+    max_results = args.max if args.max is not None else config.get("max_results", 5)
+    min_score = (args.min_score if args.min_score is not None
+                 else float(config.get("min_score", 0.45)))
 
     result: Dict[str, Any] = {
         "cache_status": cache_status,
