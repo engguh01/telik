@@ -48,19 +48,19 @@ read(candidate-6)        →  1,200 bytes
 Total: 6 files, ~1,800 tokens
 ```
 
-96.5% fewer tokens. Same edit.
+In our tests, 40–95% fewer tokens depending on prompt specificity and project size — see `benchmarks/` for methodology and raw numbers.
 
-## Numbers
+## Benchmarks
 
-Real measurement against a Next.js POS project (111 tracked files, 12 prompts averaged):
+One representative scenario from a Next.js POS project (111 tracked files):
 
 | Metric | Without telik | With telik | Saved |
 |---|---|---|---|
 | Files scanned | 17 | 6 | 65% fewer |
-| Context tokens | ~51K | ~1.8K | 96.5% |
+| Context tokens | ~51K | ~1.8K | ~96.5% |
 | Context waste | 28x extra | zero | all of it |
 
-An agent scanning the entire `src/` directory (70 files) burns 51x more context than telik. Neither reads a byte more relevant code.
+Baseline without telik: agent greps for relevant keywords (17 matches), reads each match in full. With telik: top 6 candidates. Savings vary across prompts — the 40–95% range reflects specificity and project size differences.
 
 ## How it works
 
@@ -173,6 +173,12 @@ Run tests:
 ```bash
 python3 -m unittest discover tests/
 ```
+
+## Limitations
+
+- Ranking is heuristic (filename/symbol/import matching), not semantic — it won't understand intent beyond keyword overlap.
+- Works best when files are named after what they do. Projects with heavy use of generic filenames (`index.ts`, `page.tsx` in every route folder) can see lower precision.
+- Tie-breaking falls back to alphabetical order when scores are identical — always sanity-check `candidates` before editing blind, especially when results look generic rather than component-specific.
 
 ## Requirements
 

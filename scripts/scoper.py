@@ -954,7 +954,7 @@ def score_file(
     symbol_score = 0.0
     symbol_hits = 0
     for symbol in symbols_for_file:
-        s = text_match_score(symbol.lower(), keywords)
+        s = text_match_score(symbol, keywords)
         if s > 0:
             symbol_score = max(symbol_score, s)
             symbol_hits += 1
