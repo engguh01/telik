@@ -66,8 +66,9 @@ class TestTextMatchScore(unittest.TestCase):
         self.assertEqual(scoper.text_match_score("header", ["header"]), 0.95)
 
     def test_substring_in_token(self):
+        # ponytail: kw < 4 chars no longer triggers containment match
         score = scoper.text_match_score("topheader", ["top"])
-        self.assertAlmostEqual(score, 0.8)
+        self.assertAlmostEqual(score, 0.7)
 
     def test_substring_in_raw_text(self):
         score = scoper.text_match_score("somethingheader", ["header"])

@@ -78,6 +78,8 @@ SESSION_BOOST = 0.12
 FALLBACK_IGNORE_DIRS: Set[str] = {
     ".git", "node_modules", "dist", "build", ".next", ".cache",
     "venv", ".venv", "__pycache__", ".scoper_cache",
+    # ponytail: dependency dirs for PHP/Composer, Ruby, Go, Rust, CocoaPods
+    "vendor", "Pods", "target", ".bundle",
 }
 
 CODE_EXTENSIONS: Set[str] = {
@@ -193,6 +195,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
 RUST_STDLIB_PREFIXES = {"std::", "core::", "alloc::"}
 
+# ponytail: vendor/bundle files get scored down so generic keywords don't dominate
+VENDOR_BUNDLE_PENALTY = 0.35
+VENDOR_BUNDLE_PATHS = {"public/vendor/"}
+VENDOR_BUNDLE_SUFFIXES = (".min.js", ".min.css", ".esm.js")
+
 
 # --- Git helpers -------------------------------------------------------------
 
@@ -304,6 +311,18 @@ def fnmatch_glob(path: str, pattern: str) -> bool:
                 return path.endswith(parts[1])
             return True
     return path == pattern
+
+
+def _is_vendor_bundle(rel_path: str) -> bool:
+    norm = rel_path.replace(os.sep, "/")
+    for prefix in VENDOR_BUNDLE_PATHS:
+        if norm.startswith(prefix):
+            return True
+    base = os.path.basename(norm)
+    for suffix in VENDOR_BUNDLE_SUFFIXES:
+        if base.endswith(suffix):
+            return True
+    return False
 
 
 def is_binary_file(root: str, rel_path: str) -> bool:
@@ -501,6 +520,22 @@ def get_path_aliases(root: str) -> Dict[str, str]:
             return aliases
     return {}
 
+
+def get_composer_psr4_map(root: str) -> Dict[str, str]:
+    """Read composer.json autoload.psr-4 for namespace → directory mapping."""
+    composer_path = os.path.join(root, "composer.json")
+    if not os.path.exists(composer_path):
+        return {}
+    try:
+        with open(composer_path, "r") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    psr4 = data.get("autoload", {}).get("psr-4", {})
+    if not isinstance(psr4, dict):
+        return {}
+    return {ns.rstrip("\\"): dir for ns, dir in psr4.items()}
+
 # Token frequency thresholds for common-path penalty.
 FREQUENCY_PENALTY_THRESHOLD = 0.3
 FREQUENCY_PENALTY_FACTOR = 0.85
@@ -676,7 +711,10 @@ PHP_SOURCE_DIRS = ["", "src/", "lib/", "app/"]
 
 
 def resolve_php_import(
-    importer_rel_path: str, raw_import: str, files_set: Set[str]
+    importer_rel_path: str,
+    raw_import: str,
+    files_set: Set[str],
+    composer_map: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     if raw_import.startswith(".") or "/" in raw_import:
         importer_dir = os.path.dirname(importer_rel_path)
@@ -688,6 +726,16 @@ def resolve_php_import(
             if c in files_set:
                 return c
         return None
+
+    # ponytail: PSR-4 namespace resolution via composer.json
+    if composer_map:
+        for ns, directory in composer_map.items():
+            ns_prefix = ns + "\\"
+            if raw_import.startswith(ns_prefix):
+                sub = raw_import[len(ns_prefix):].replace("\\", "/") + ".php"
+                candidate = directory.rstrip("/") + "/" + sub
+                if candidate in files_set:
+                    return candidate
 
     path = raw_import.replace("\\", "/") + ".php"
     for source_dir in PHP_SOURCE_DIRS:
@@ -715,6 +763,7 @@ def build_import_graph(
     files: List[str],
     extra_extensions: Optional[Set[str]] = None,
     aliases: Optional[Dict[str, str]] = None,
+    composer_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     files_set = set(files)
     go_module_name = get_go_module_name(root)
@@ -738,7 +787,7 @@ def build_import_graph(
             elif kind == "ruby":
                 target = resolve_ruby_import(rel_path, raw, files_set)
             elif kind == "php":
-                target = resolve_php_import(rel_path, raw, files_set)
+                target = resolve_php_import(rel_path, raw, files_set, composer_map)
             elif kind == "java":
                 target = resolve_java_import(rel_path, raw, files_set)
             if target and target != rel_path:
@@ -819,8 +868,9 @@ def build_index(
 
     symbols = build_symbol_index(root, files, extra_extensions)
     aliases = get_path_aliases(root)
+    composer_map = get_composer_psr4_map(root)
     imports_forward, importers_reverse = build_import_graph(
-        root, files, extra_extensions, aliases
+        root, files, extra_extensions, aliases, composer_map
     )
     package_roots = detect_package_roots(files)
     token_frequencies = compute_path_token_frequencies(files)
@@ -914,7 +964,7 @@ def text_match_score(text_lower: str, keywords: List[str]) -> float:
         if kw in tokens:
             best = max(best, 0.95)
             continue
-        if any(kw in tok or tok in kw for tok in tokens if len(tok) > 2):
+        if any(kw in tok or tok in kw for tok in tokens if len(tok) >= 4 and len(kw) >= 4):
             best = max(best, 0.8)
             continue
         if kw in text_lower:
@@ -1125,6 +1175,9 @@ def match_candidates(
             session_boosts.get(f, 0.0),
             freq_map,
         )
+        # ponytail: vendor/bundle files get penalized so generic keywords don't win
+        if _is_vendor_bundle(f):
+            score *= VENDOR_BUNDLE_PENALTY
         scored.append((f, score, hits))
 
     if use_monorepo:

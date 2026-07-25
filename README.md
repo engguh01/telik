@@ -40,27 +40,32 @@ Total: 17 files, ~51,000 tokens
 **With telik**, the agent locates first:
 
 ```
-scoper.py --scope "..."  →  6 candidates
-read(candidate-1)        →  2,500 bytes
-  ... 4 more reads ...
-read(candidate-6)        →  1,200 bytes
+scoper.py --scope "..."  →  5 candidates
+read(candidate-1)        →  2,829 bytes
+  ... 3 more reads ...
+read(candidate-5)        →    535 bytes
 ───────────────────────────────────
-Total: 6 files, ~1,800 tokens
+Total: 5 files, ~6,121 tokens
 ```
 
-In our tests, 40–95% fewer tokens depending on prompt specificity and project size — see `benchmarks/` for methodology and raw numbers.
+On a Laravel POS app (727 tracked files), telik averages **86% fewer tokens** across 5 test prompts — and **98%** when vendor-bundle candidates are excluded (which the latest fix now handles).
 
 ## Benchmarks
 
-One representative scenario from a Next.js POS project (111 tracked files):
+Lakasir v1.1.11 (Laravel 11 + Filament + Livewire, 727 files). Baseline: grep 1–2 dominant keywords, read all matches in full.
 
-| Metric | Without telik | With telik | Saved |
+| Prompt | Files (telik) | Files (baseline) | Token savings |
 |---|---|---|---|
-| Files scanned | 17 | 6 | 65% fewer |
-| Context tokens | ~51K | ~1.8K | ~96.5% |
-| Context waste | 28x extra | zero | all of it |
+| fix save button di halaman add product | 5 | 180 | **98.96%** |
+| tambahin validasi stock pas checkout di cashier page | 5 | 112 | **96.32%** |
+| fix bug discount ga kehitung di cashier report | 5 | 52 | **94.63%** |
+| samain style widget best selling product sama expired product | 5 | 170 | 76.68% |
+| samain card member style sama product resource | 5 | 207 | 75.03% |
+| **Average** | **5** | **144** | **86.26%** |
 
-Baseline without telik: agent greps for relevant keywords (17 matches), reads each match in full. With telik: top 6 candidates. Savings vary across prompts — the 40–95% range reflects specificity and project size differences.
+After excluding large vendor/bundle files from candidates (latest fix), the average rises to **98.46%**. Savings depend on prompt language — code-switching (Indonesian + English technical terms) performs best; pure Indonesian without technical terms can miss.
+
+Baseline without telik: agent greps for relevant keywords, reads each match in full. With telik: top 5 candidates. File reduction averages 95.6% (5 vs ~144 files).
 
 ## How it works
 
@@ -84,9 +89,9 @@ The scoper combines five signals:
 2. **Symbol extraction** : regex-scans JS, TS, Python, Go, Rust, Kotlin, C#, Swift, Dart for function/class/component names
 3. **Git recency** : files you touched recently get a ranking nudge
 4. **Session memory** : similar prompts boost prior candidates (multi-turn "continue from before")
-5. **Import graph** : resolves relative imports and TS path aliases (`@/`) across 9 languages, surfaces 1-hop neighbors
+5. **Import graph** : resolves relative imports and TS path aliases (`@/`) across 10 languages, PHP PSR-4 via `composer.json`, surfaces 1-hop neighbors
 
-Scoring extras: frequency penalty for common path tokens, tie-breaking by keyword density, symbol multi-hit boost.
+Scoring extras: frequency penalty for common path tokens, tie-breaking by keyword density, symbol multi-hit boost, vendor/bundle file penalty (large bundled files scored down so generic keywords don't dominate).
 
 ## Features
 
@@ -95,13 +100,15 @@ Scoring extras: frequency penalty for common path tokens, tie-breaking by keywor
 | `.gitignore`-aware listing | `git ls-files` for git repos, `os.walk` + `.gitignore` parsing for others |
 | Cached index | `.scoper_cache/` stores file list, symbols, imports : reused across prompts |
 | Smart invalidation | Git fingerprint (HEAD hash + dirty count), 5-min mtime fallback |
-| 9-language import graph | JS, TS, Python, Go, Rust, Ruby, PHP, Java. TS path aliases (`@/`) resolved |
+| 10-language import graph | JS, TS, Python, Go, Rust, Ruby, PHP, Java. TS path aliases (`@/`) resolved. PHP PSR-4 via `composer.json` |
 | 10-language symbols | Regex extraction for declarations in 10 languages |
 | Monorepo penalty | Cross-package candidates deprioritized, never excluded |
+| Vendor bundle penalty | `public/vendor/`, `*.min.js`, `*.min.css`, `*.esm.js` scored down so generic keywords don't dominate |
 | Token warnings | Flags files >2K tokens or totals >6K |
 | Session memory | `.scoper_cache/session_log.json` for multi-turn continuity |
 | Config file | `~/.scoperrc` (global) or `./.scoperrc` (project) : JSON overrides |
 | Binary safety | Null-byte detection skips binary files |
+| Default ignore dirs | `vendor/`, `node_modules/`, `Pods/`, `target/`, `.bundle/` excluded from fallback listing |
 
 ## Install
 
@@ -178,11 +185,14 @@ python3 -m unittest discover tests/
 
 - Ranking is heuristic (filename/symbol/import matching), not semantic — it won't understand intent beyond keyword overlap.
 - Works best when files are named after what they do. Projects with heavy use of generic filenames (`index.ts`, `page.tsx` in every route folder) can see lower precision.
+- Prompt language matters: code-switching (Indonesian + English technical terms) works best. Pure Indonesian prompts without English technical terms can miss relevant files because the scorer has no synonym layer.
+- Git is strongly recommended. Without `.gitignore`, `vendor/` and other dependency dirs are excluded by default but project-specific ignore patterns won't be applied.
+- PHP PSR-4 import resolution reads `composer.json` `autoload.psr-4` — works for standard Laravel/Symfony setups but won't cover custom autoload configurations.
 - Tie-breaking falls back to alphabetical order when scores are identical — always sanity-check `candidates` before editing blind, especially when results look generic rather than component-specific.
 
 ## Requirements
 
-Python 3.7+, stdlib only. Git optional but recommended.
+Python 3.7+, stdlib only. Git optional but recommended for best accuracy (enables `.gitignore`-aware listing, git recency boost, and proper index caching).
 
 ## License
 
